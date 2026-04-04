@@ -1,2 +1,3 @@
 # domain-routing-openwrt-add-ips
-Данный скрипт добавляет роутинг по IP на уже установленную систему через 
+Данный скрипт добавляет роутинг по IP в дополнение доменам на уже установленную систему через domain-routing-openwrt от itdoginfo
+https://github.com/itdoginfo/domain-routing-openwrt
