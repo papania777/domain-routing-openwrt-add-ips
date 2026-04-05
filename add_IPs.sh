@@ -1,17 +1,12 @@
 #!/bin/sh
 # =============================================================================
-# add-ip-subnet-routing-v4.1.sh (Optimized + Community List)
-# Добавляет list_ip, list_subnet, list_community в domain-routing-openwrt
-# Источник community: https://community.antifilter.download/list/community.lst
-# Оптимизация: awk + nft -f (загрузка 43k IP за ~2 сек)
-# Совместимость: OpenWrt 23.05+, fw4 (nftables), 256MB RAM
+# add-ip-subnet-routing-v4.2-hotfix.sh
+# Исправлено: удалён bash-синтаксис, полная совместимость с ash/OpenWrt
+# Оптимизация: awk + nft -f, батч 500 записей, fallback через temp-файл
+# Совместимость: OpenWrt 23.05/24.10, fw4, nftables 1.0.9+, 256MB RAM
 # =============================================================================
 
-GREEN='\033[32;1m'
-RED='\033[31;1m'
-YELLOW='\033[33;1m'
-NC='\033[0m'
-
+GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
 log_info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
 log_warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
@@ -23,22 +18,22 @@ check_prereqs() {
     log_info "Checking prerequisites..."
     command -v curl >/dev/null 2>&1 || { log_error "curl missing"; exit 1; }
     command -v nft  >/dev/null 2>&1 || { log_error "nft missing"; exit 1; }
-    nft list table inet fw4 >/dev/null 2>&1 || { log_error "Table inet fw4 not found. Run main script first."; exit 1; }
+    nft list table inet fw4 >/dev/null 2>&1 || { log_error "Table inet fw4 not found"; exit 1; }
     grep -q "^[[:space:]]*99[[:space:]]\+vpn" /etc/iproute2/rt_tables 2>/dev/null || {
         log_info "Adding '99 vpn' to rt_tables"; echo '99 vpn' >> /etc/iproute2/rt_tables
     }
+    NFT_VER=$(nft --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [ -n "$NFT_VER" ] && log_info "nftables $NFT_VER detected"
     log_info "Prerequisites OK."
 }
 
 # =============================================================================
-# 2. Создание nft sets (idempotent)
+# 2. Создание nft sets
 # =============================================================================
 create_sets() {
     log_info "Preparing nft sets..."
     for set in vpn_ip vpn_subnets vpn_community; do
-        if nft list set inet fw4 "$set" >/dev/null 2>&1; then
-            log_info "Set '$set' exists."
-        else
+        if ! nft list set inet fw4 "$set" >/dev/null 2>&1; then
             nft add set inet fw4 "$set" '{ type ipv4_addr; flags interval; }' 2>/dev/null || {
                 log_error "Failed to create set '$set'"; exit 1
             }
@@ -47,51 +42,47 @@ create_sets() {
 }
 
 # =============================================================================
-# 3. Очистка устаревших UCI-правил с параметром 'ipset' (КРИТИЧЕСКИЙ ФИКС)
+# 3. Очистка legacy UCI-правил
 # =============================================================================
 cleanup_legacy_uci() {
     log_info "Checking for legacy 'ipset' UCI rules..."
-    local found=0
     for rule in $(uci show firewall 2>/dev/null | grep -E "@rule\[.*\]\.ipset='vpn_" | cut -d= -f1 | cut -d. -f2); do
-        log_info "Deleting legacy rule: $rule (ipset -> set migration)"
+        log_info "Deleting legacy rule: $rule"
         uci delete firewall."$rule" >/dev/null 2>&1
-        found=1
     done
-    if [ "$found" -eq 1 ]; then
-        uci commit firewall >/dev/null 2>&1
-        log_info "Legacy rules removed."
-    fi
+    uci commit firewall >/dev/null 2>&1
 }
 
 # =============================================================================
-# 4. Оптимизированная загрузка списков (awk + nft -f)
+# 4. Оптимизированная загрузка (POSIX-совместимая)
 # =============================================================================
 load_list_fast() {
     local list_name="$1" set_name="$2" url_base="${3:-https://antifilter.download}"
     local url="${url_base}/list/${list_name}.lst"
     local tmp="/tmp/lst/${list_name}.lst"
     local nft_cmd="/tmp/lst/${list_name}.nft"
+    local valid_ips="/tmp/lst/${list_name}.valid"
     mkdir -p /tmp/lst
 
-    log_info "Downloading ${list_name}.lst from ${url_base}..."
+    log_info "Downloading ${list_name}.lst..."
     curl -f -s --max-time 120 -o "$tmp" "$url" 2>/dev/null || { log_error "Download failed: $url"; return 1; }
     [ -s "$tmp" ] || { log_error "File empty: $tmp"; return 1; }
 
     log_info "Flushing set '$set_name'..."
     nft flush set inet fw4 "$set_name" 2>/dev/null || true
 
-    log_info "Converting and loading via awk + nft -f (optimized)..."
-    # POSIX-совместимый awk для BusyBox
+    log_info "Converting entries via awk (batch: 500)..."
+    # Генерация команд nft с батчами по 500 записей
     awk -v set="$set_name" '
-    BEGIN { c=0 }
+    BEGIN { c=0; batch=0 }
     /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
     {
         gsub(/[[:space:]]/, "")
         if ($0 ~ /^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*(\/[0-9][0-9]*)?$/) {
-            if (c == 0) printf "add element inet fw4 %s { %s", set, $0
+            if (c == 0) { if (batch > 0) printf "\n}\n"; printf "add element inet fw4 %s { %s", set, $0 }
             else printf ", %s", $0
-            c++
-            if (c == 2000) { printf "\n}\n"; c=0 }
+            c++; batch++
+            if (batch == 500) { printf "\n}\n"; c=0; batch=0 }
         }
     }
     END { if (c > 0) printf "\n}\n" }
@@ -99,49 +90,64 @@ load_list_fast() {
 
     if [ ! -s "$nft_cmd" ]; then
         log_warn "No valid entries found in ${list_name}.lst"
-        rm -f "$nft_cmd" "$tmp"
+        rm -f "$nft_cmd" "$tmp" "$valid_ips"
         return 1
     fi
 
-    log_info "Executing bulk nft load..."
-    if nft -f "$nft_cmd" 2>/dev/null; then
-        log_info "Successfully loaded entries into '$set_name'."
+    log_info "Loading via nft -f..."
+    NFT_ERR=$(nft -f "$nft_cmd" 2>&1)
+    if [ $? -eq 0 ]; then
+        log_info "Loaded '$set_name' via nft -f."
     else
-        log_warn "nft -f failed. Fallback to line-by-line (slow)..."
-        grep -oE '[0-9.]+(/[0-9]+)?' "$nft_cmd" 2>/dev/null | tr -d '{}' | while read -r ip; do
-            nft add element inet fw4 "$set_name" "{ $ip }" 2>/dev/null || true
-        done
+        log_warn "nft -f failed: $NFT_ERR"
+        log_info "Fallback: batched load via temp file..."
+        
+        # === ИСПРАВЛЕНИЕ: вместо < <(...) используем временный файл ===
+        # Извлекаем валидные IP в отдельный файл
+        grep -oE '^[0-9.]+(/[0-9]{1,2})?$' "$tmp" 2>/dev/null > "$valid_ips" || true
+        
+        if [ -s "$valid_ips" ]; then
+            local batch="" cnt=0
+            while IFS= read -r ip; do
+                [ -z "$ip" ] && continue
+                [ -z "$batch" ] && batch="$ip" || batch="${batch}, ${ip}"
+                cnt=$((cnt + 1))
+                if [ $cnt -ge 100 ]; then
+                    nft add element inet fw4 "$set_name" "{ $batch }" 2>/dev/null || true
+                    batch="" cnt=0
+                fi
+            done < "$valid_ips"
+            [ -n "$batch" ] && nft add element inet fw4 "$set_name" "{ $batch }" 2>/dev/null || true
+            log_info "Fallback load completed for '$set_name'."
+        else
+            log_warn "No valid IPs extracted for fallback"
+        fi
+        rm -f "$valid_ips"
     fi
-
+    
     rm -f "$nft_cmd" "$tmp"
     return 0
 }
 
 # =============================================================================
-# 5. Применение прямых nft-правил + persistence
+# 5. Применение правил маркировки + persistence
 # =============================================================================
 apply_mark_rules() {
-    log_info "Applying direct nft marking rules..."
+    log_info "Applying nft marking rules..."
     
     cat > /usr/sbin/apply-vpn-mark-rules.sh << 'HELPER_EOF'
 #!/bin/sh
 [ -z "$(nft list table inet fw4 2>/dev/null)" ] && exit 0
 add_if_missing() {
     nft list chain inet fw4 "$1" 2>/dev/null | grep -q "$2" || \
-        nft add rule inet fw4 "$1" ip daddr "$3" meta mark set 0x1 comment "$2" 2>/dev/null
+        nft add rule inet fw4 "$1" ip daddr "$3" meta mark set 0x1 comment "$2" 2>/dev/null || true
 }
-# Domains
-add_if_missing prerouting "mark_vpn_domains_prerouting" "@vpn_domains"
-add_if_missing output     "mark_vpn_domains_output"      "@vpn_domains"
-# IP
-add_if_missing prerouting "mark_vpn_ip_prerouting"       "@vpn_ip"
-add_if_missing output     "mark_vpn_ip_output"           "@vpn_ip"
-# Subnets
-add_if_missing prerouting "mark_vpn_sub_prerouting"      "@vpn_subnets"
-add_if_missing output     "mark_vpn_sub_output"          "@vpn_subnets"
-# Community
-add_if_missing prerouting "mark_vpn_comm_prerouting"     "@vpn_community"
-add_if_missing output     "mark_vpn_comm_output"         "@vpn_community"
+for chain in prerouting output; do
+    add_if_missing "$chain" "mark_vpn_domains_${chain}" "@vpn_domains"
+    add_if_missing "$chain" "mark_vpn_ip_${chain}"       "@vpn_ip"
+    add_if_missing "$chain" "mark_vpn_sub_${chain}"      "@vpn_subnets"
+    add_if_missing "$chain" "mark_vpn_comm_${chain}"     "@vpn_community"
+done
 HELPER_EOF
     chmod +x /usr/sbin/apply-vpn-mark-rules.sh
 
@@ -153,7 +159,6 @@ HELPER_EOF
         uci commit firewall >/dev/null 2>&1
         log_info "Persistence helper registered."
     fi
-
     /usr/sbin/apply-vpn-mark-rules.sh
     log_info "Marking rules active."
 }
@@ -168,7 +173,6 @@ setup_cron() {
     echo "$cur" | grep -q "add-ip-subnet-routing" 2>/dev/null && return 0
     { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || log_warn "Crontab update failed"
     /etc/init.d/cron restart >/dev/null 2>&1 || true
-    log_info "Cron configured (every 12h)."
 }
 
 # =============================================================================
@@ -176,8 +180,8 @@ setup_cron() {
 # =============================================================================
 main() {
     echo "============================================================"
-    echo "  Add IP/Subnet/Community Routing v4.1 (Optimized)"
-    echo "  Fast load (awk+nft), correct chains, persistence"
+    echo "  Add IP/Subnet/Community Routing v4.2-hotfix"
+    echo "  POSIX-compatible (ash), nftables 1.0.9+ ready"
     echo "============================================================"
     
     check_prereqs || exit 1
@@ -187,10 +191,9 @@ main() {
     log_info "Checking free RAM..."
     FREE_KB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || free | awk '/^Mem:/ {print $4}')
     if [ -n "$FREE_KB" ] && [ "$FREE_KB" -lt 50000 ]; then
-        log_warn "Low RAM (${FREE_KB}KB). Loading 4 lists may be slow. Consider stopping heavy services."
+        log_warn "Low RAM (${FREE_KB}KB). Loading may be slower."
     fi
 
-    # Загрузка списков (параллельно не делаем — экономим RAM)
     load_list_fast "ip" "vpn_ip" "https://antifilter.download" || log_warn "list_ip failed"
     load_list_fast "subnet" "vpn_subnets" "https://antifilter.download" || log_warn "list_subnet failed"
     load_list_fast "community" "vpn_community" "https://community.antifilter.download" || log_warn "list_community failed"
@@ -202,7 +205,7 @@ main() {
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     
     echo "============================================================"
-    log_info "DONE. Verify with commands below."
+    log_info "DONE. Verify: nft list sets | grep vpn_"
     echo "============================================================"
 }
 
@@ -213,9 +216,9 @@ case "${1:-start}" in
     start) main ;;
     stop)
         log_info "Clearing sets..."
-        nft flush set inet fw4 vpn_ip 2>/dev/null || true
-        nft flush set inet fw4 vpn_subnets 2>/dev/null || true
-        nft flush set inet fw4 vpn_community 2>/dev/null || true
+        for s in vpn_ip vpn_subnets vpn_community; do
+            nft flush set inet fw4 "$s" 2>/dev/null || true
+        done
         ;;
     reload|restart) "$0" stop; sleep 1; "$0" start ;;
     *) echo "Usage: $0 {start|stop|reload|restart}"; exit 1 ;;
