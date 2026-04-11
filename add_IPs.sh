@@ -47,8 +47,7 @@ create_sets() {
 }
 
 # =============================================================================
-# 3. Очистка legacy UCI-правил
-# =============================================================================
+# 3. Очистка legacy UCI-правил# =============================================================================
 cleanup_legacy_uci() {
     log_info "Checking for legacy 'ipset' UCI rules..."
     local rules
@@ -97,8 +96,7 @@ load_list_fast() {
 
         # Быстрая валидация IPv4/CIDR через shell-native case (без grep в цикле!)
         case "$line" in
-            [0-9].[0-9].[0-9].[0-9]|[0-9].[0-9].[0-9].[0-9]/[0-9]*) ;;
-            *) continue ;;
+            [0-9].[0-9].[0-9].[0-9]|[0-9].[0-9].[0-9].[0-9]/[0-9]*) ;;            *) continue ;;
         esac
 
         if [ -z "$batch" ]; then
@@ -147,8 +145,7 @@ for chain in prerouting output; do
     add_if_missing "$chain" "mark_vpn_domains_${chain}" "@vpn_domains"
     add_if_missing "$chain" "mark_vpn_ip_${chain}"       "@vpn_ip"
     add_if_missing "$chain" "mark_vpn_sub_${chain}"      "@vpn_subnets"
-    add_if_missing "$chain" "mark_vpn_comm_${chain}"     "@vpn_community"
-done
+    add_if_missing "$chain" "mark_vpn_comm_${chain}"     "@vpn_community"done
 HELPER_EOF
     chmod +x /usr/sbin/apply-vpn-mark-rules.sh
 
@@ -197,8 +194,7 @@ main() {
         free_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
     fi
     if [ "$free_mb" -eq 0 ] 2>/dev/null; then
-        free_mb=$(free -m 2>/dev/null | awk '/^Mem:/ {print $4}')
-    fi
+        free_mb=$(free -m 2>/dev/null | awk '/^Mem:/ {print $4}')    fi
     if [ -n "$free_mb" ] && [ "$free_mb" -lt 50 ]; then
         log_warn "Low RAM (${free_mb}MB). Loading will proceed safely."
     fi
