@@ -1,8 +1,7 @@
 #!/bin/sh
 # =============================================================================
-# add-ip-subnet-routing-v5.1-fix.sh (Path Mismatch Fixed)
-# Self-Healing, Stream-Safe, Optimized Routing Installer
-# Исправлено: рассинхронизация путей /tmp/lst/ между скачиванием и загрузкой
+# add-ip-subnet-routing-v5.2-robust.sh (Self-Healing + Bulletproof Parser)
+# Исправлено: пути файлов, парсинг \r/пробелов, добавлена диагностика
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -66,23 +65,23 @@ v5_validate() {
 }
 
 # =============================================================================
-# PHASE 3: DOWNLOAD & LOAD (FIXED PATHS)
+# PHASE 3: DOWNLOAD & LOAD (ROBUST PARSER)
 # =============================================================================
 v5_download() {
     dl_name="$1"; dl_set="$2"; dl_base="${3:-https://antifilter.download}"
     dl_url="${dl_base}/list/${dl_name}.lst"
-    # ИСПРАВЛЕНО: сохраняем под именем сета, чтобы v5_load_batch нашёл файл
+    # FIXED: сохраняем под именем сета, чтобы v5_load_batch нашёл файл
     dl_tmp="/tmp/lst/${dl_set}.lst"
     mkdir -p /tmp/lst
 
-    log_i "Downloading ${dl_name}.lst -> ${dl_set}.lst..."
+    log_i "Downloading ${dl_name}.lst..."
     if ! curl -f -s --max-time 120 -o "$dl_tmp" "$dl_url" 2>/dev/null; then
         log_w "Download failed: ${dl_name}"; return 1
     fi
     if [ ! -s "$dl_tmp" ]; then
         log_w "File empty: ${dl_name}"; return 1
     fi
-    log_i "Downloaded ${dl_name}."
+    log_i "Downloaded ${dl_name} ($(wc -l < "$dl_tmp") lines)."
     return 0
 }
 
@@ -92,16 +91,23 @@ v5_load_batch() {
     ld_valid="/tmp/lst/${ld_set}.valid"
     ld_batch="/tmp/lst/batch.nft"
     
-    log_i "Filtering & loading ${ld_set}..."
+    log_i "Parsing & loading ${ld_set}..."
     if [ ! -f "$ld_src" ]; then
-        log_w "Source file missing: $ld_src (download likely failed)"; return 1
+        log_w "Source file missing: $ld_src (download failed)"; return 1
     fi
 
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]{1,2})?$' "$ld_src" > "$ld_valid" 2>/dev/null || true
+    # ROBUST: убираем \r, вырезаем только IP/CIDR, удаляем дубликаты
+    sed 's/\r//g' "$ld_src" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]{1,2})?' | sort -u > "$ld_valid" 2>/dev/null || true
+
     if [ ! -s "$ld_valid" ]; then
-        log_w "No valid entries found in ${ld_src}"; rm -f "$ld_valid" "$ld_batch"; return 0
+        log_w "No valid IPs extracted from ${ld_set}"
+        log_w "First 3 raw lines:"
+        head -n 3 "$ld_src"
+        rm -f "$ld_src" "$ld_valid" "$ld_batch"
+        return 1
     fi
 
+    log_i "Loading $(wc -l < "$ld_valid") unique entries into ${ld_set}..."
     nft flush set inet fw4 "$ld_set" 2>/dev/null || true
     ld_cnt=0; ld_b=""; ld_done=0
 
@@ -169,7 +175,7 @@ v5_cron() {
 # =============================================================================
 v5_main() {
     echo "============================================================"
-    echo "  Routing Installer v5.1-Fix (Path Sync + Self-Healing)"
+    echo "  Routing Installer v5.2-Robust (Self-Healing)"
     echo "============================================================"
     v5_cleanup
     v5_validate
