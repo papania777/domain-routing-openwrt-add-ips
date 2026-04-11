@@ -1,7 +1,9 @@
 #!/bin/sh
 # =============================================================================
-# add-ip-subnet-routing-v5.2-robust.sh (Self-Healing + Bulletproof Parser)
-# Исправлено: пути файлов, парсинг \r/пробелов, добавлена диагностика
+# add-ip-subnet-routing-v5.3-ultimate.sh
+# Self-Healing, Robust, Fixed Missing Sets & Race Conditions
+# Полностью автоматическая очистка, валидация, создание сетов и загрузка.
+# Совместимость: OpenWrt 23.05/24.10, ash (stream), fw4/nft, 256MB RAM
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -10,10 +12,12 @@ log_w() { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 log_e() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 # =============================================================================
-# PHASE 1: DEEP CLEANUP
+# PHASE 1: DEEP CLEANUP & MIGRATION
 # =============================================================================
 v5_cleanup() {
     log_i "Phase 1: Deep cleanup & migration..."
+    
+    # 1. Очистка cron
     cr_cur=$(crontab -l 2>/dev/null) || cr_cur=""
     cr_new=$(echo "$cr_cur" | grep -v "add-ip-subnet-routing")
     if [ "$cr_cur" != "$cr_new" ]; then
@@ -21,7 +25,8 @@ v5_cleanup() {
         log_i "Cleared old cron entries."
     fi
 
-    uci_rules=$(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_|path.*apply-vpn-mark-rules")
+    # 2. Удаление старых UCI-правил firewall (только для vpn_ip/subnet/community)
+    uci_rules=$(uci show firewall 2>/dev/null | grep -E "\.(ipset|set)='vpn_(ip|subnet|community)'|path.*apply-vpn-mark-rules")
     if [ -n "$uci_rules" ]; then
         for r in $(echo "$uci_rules" | cut -d= -f1 | cut -d. -f2); do
             uci delete firewall."$r" >/dev/null 2>&1 || true
@@ -30,29 +35,38 @@ v5_cleanup() {
         log_i "Cleared legacy UCI firewall rules."
     fi
 
+    # 3. Удаление старых helper-скриптов и init-скриптов
     rm -f /usr/sbin/apply-vpn-mark-rules.sh /etc/init.d/add-ip-subnet-routing
-    for s in vpn_ip vpn_subnets vpn_community vpn_domains; do
+
+    # 4. Очистка ТОЛЬКО наших сетов (vpn_domains НЕ трогаем)
+    for s in vpn_ip vpn_subnets vpn_community; do
         nft flush set inet fw4 "$s" 2>/dev/null || true
     done
-    rm -rf /tmp/lst/* /tmp/batch.nft
-    log_i "Flushed nft sets & cleared temp files."
+    log_i "Flushed specific nft sets (preserving vpn_domains)."
+
+    # 5. Очистка временных файлов
+    rm -rf /tmp/lst/* /tmp/batch.nft /tmp/routing-v*.sh /tmp/add*.sh
+    log_i "Cleared temp files."
 }
 
 # =============================================================================
-# PHASE 2: VALIDATION & REPAIR
+# PHASE 2: SYSTEM VALIDATION & REPAIR
 # =============================================================================
 v5_validate() {
     log_i "Phase 2: System validation & repair..."
-    command -v curl >/dev/null 2>&1 || { log_e "curl missing"; exit 1; }
-    command -v nft  >/dev/null 2>&1 || { log_e "nft missing"; exit 1; }
-    nft list table inet fw4 >/dev/null 2>&1 || { log_e "Table inet fw4 not found"; exit 1; }
+    
+    if ! command -v curl >/dev/null 2>&1; then log_e "curl missing. Install via opkg."; exit 1; fi
+    if ! command -v nft  >/dev/null 2>&1; then log_e "nft missing. Install via opkg."; exit 1; fi
+    if ! nft list table inet fw4 >/dev/null 2>&1; then log_e "Table inet fw4 not found."; exit 1; fi
 
+    # Исправление rt_tables
     if grep -q "^[[:space:]]*99[[:space:]]*vpn" /etc/iproute2/rt_tables 2>/dev/null; then
         sed -i '/^[[:space:]]*99[[:space:]]*vpn/d' /etc/iproute2/rt_tables 2>/dev/null || true
     fi
     echo '99 vpn' >> /etc/iproute2/rt_tables
     log_i "Fixed rt_tables (99 vpn)."
 
+    # Проверка/создание правила маркировки в network UCI
     if ! uci show network 2>/dev/null | grep -q "mark='0x1'"; then
         uci add network rule >/dev/null 2>&1
         uci set network.@rule[-1].name='mark0x1'
@@ -65,12 +79,27 @@ v5_validate() {
 }
 
 # =============================================================================
+# PHASE 2.5: CREATE MISSING SETS (CRITICAL FIX)
+# =============================================================================
+v5_create_sets() {
+    log_i "Phase 2.5: Ensuring nft sets exist..."
+    for s in vpn_ip vpn_subnets vpn_community; do
+        if ! nft list set inet fw4 "$s" >/dev/null 2>&1; then
+            if nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null; then
+                log_i "Created set $s."
+            else
+                log_e "Failed to create set $s. Check nftables."
+            fi
+        fi
+    done
+}
+
+# =============================================================================
 # PHASE 3: DOWNLOAD & LOAD (ROBUST PARSER)
 # =============================================================================
 v5_download() {
     dl_name="$1"; dl_set="$2"; dl_base="${3:-https://antifilter.download}"
     dl_url="${dl_base}/list/${dl_name}.lst"
-    # FIXED: сохраняем под именем сета, чтобы v5_load_batch нашёл файл
     dl_tmp="/tmp/lst/${dl_set}.lst"
     mkdir -p /tmp/lst
 
@@ -96,12 +125,12 @@ v5_load_batch() {
         log_w "Source file missing: $ld_src (download failed)"; return 1
     fi
 
-    # ROBUST: убираем \r, вырезаем только IP/CIDR, удаляем дубликаты
+    # ROBUST: sed удаляет \r, grep вырезает IP/CIDR, sort -u удаляет дубли
     sed 's/\r//g' "$ld_src" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]{1,2})?' | sort -u > "$ld_valid" 2>/dev/null || true
 
     if [ ! -s "$ld_valid" ]; then
         log_w "No valid IPs extracted from ${ld_set}"
-        log_w "First 3 raw lines:"
+        log_w "First 3 raw lines of ${ld_set}.lst:"
         head -n 3 "$ld_src"
         rm -f "$ld_src" "$ld_valid" "$ld_batch"
         return 1
@@ -109,22 +138,32 @@ v5_load_batch() {
 
     log_i "Loading $(wc -l < "$ld_valid") unique entries into ${ld_set}..."
     nft flush set inet fw4 "$ld_set" 2>/dev/null || true
+    
     ld_cnt=0; ld_b=""; ld_done=0
 
     while IFS= read -r ld_l; do
         [ -z "$ld_l" ] && continue
         [ -z "$ld_b" ] && ld_b="$ld_l" || ld_b="${ld_b}, ${ld_l}"
         ld_cnt=$((ld_cnt + 1))
+        
+        # Пакетная загрузка по 500 записей
         if [ "$ld_cnt" -ge 500 ]; then
             printf 'add element inet fw4 %s { %s }\n' "$ld_set" "$ld_b" > "$ld_batch"
-            nft -f "$ld_batch" 2>/dev/null && ld_done=$((ld_done + ld_cnt))
+            if nft -f "$ld_batch" 2>/dev/null; then
+                ld_done=$((ld_done + ld_cnt))
+            else
+                log_w "nft load failed for batch in ${ld_set} (set missing?)"
+            fi
             ld_b=""; ld_cnt=0
         fi
     done < "$ld_valid"
 
+    # Остаток
     if [ -n "$ld_b" ]; then
         printf 'add element inet fw4 %s { %s }\n' "$ld_set" "$ld_b" > "$ld_batch"
-        nft -f "$ld_batch" 2>/dev/null && ld_done=$((ld_done + ld_cnt))
+        if nft -f "$ld_batch" 2>/dev/null; then
+            ld_done=$((ld_done + ld_cnt))
+        fi
     fi
 
     rm -f "$ld_src" "$ld_valid" "$ld_batch"
@@ -133,16 +172,19 @@ v5_load_batch() {
 }
 
 # =============================================================================
-# PHASE 4: RULES & PERSISTENCE
+# PHASE 4: RULES & PERSISTENCE (IDEMPOTENT)
 # =============================================================================
 v5_apply_rules() {
     log_i "Phase 4: Applying rules & persistence..."
     h_path="/usr/sbin/apply-vpn-mark-rules.sh"
+    
+    # Создаем скрипт с проверкой существования правил (чтобы не дублировать)
     printf '%s\n' '#!/bin/sh' \
         '[ -z "$(nft list table inet fw4 2>/dev/null)" ] && exit 0' \
         'for v5c in prerouting output; do' \
         '    for v5s in vpn_domains vpn_ip vpn_subnets vpn_community; do' \
-        '        nft add rule inet fw4 "$v5c" ip daddr @"$v5s" meta mark set 0x1 comment "v5_${v5s}_${v5c}" 2>/dev/null || true' \
+        '        nft list chain inet fw4 "$v5c" 2>/dev/null | grep -q "v5_${v5s}_${v5c}" || \' \
+        '            nft add rule inet fw4 "$v5c" ip daddr @"$v5s" meta mark set 0x1 comment "v5_${v5s}_${v5c}" 2>/dev/null || true' \
         '    done' \
         'done' > "$h_path"
     chmod +x "$h_path"
@@ -154,6 +196,7 @@ v5_apply_rules() {
         uci set firewall.@include[-1].reload='1'
         uci commit firewall >/dev/null 2>&1
     fi
+    
     "$h_path"
     log_i "Marking rules active & persistence registered."
 }
@@ -171,14 +214,16 @@ v5_cron() {
 }
 
 # =============================================================================
-# MAIN
+# MAIN ORCHESTRATOR
 # =============================================================================
 v5_main() {
     echo "============================================================"
-    echo "  Routing Installer v5.2-Robust (Self-Healing)"
+    echo "  Routing Installer v5.3-Ultimate (Self-Healing)"
     echo "============================================================"
+    
     v5_cleanup
     v5_validate
+    v5_create_sets  # <--- КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
     
     log_i "Phase 3: Parallel download & sequential load..."
     v5_download "ip" "vpn_ip" "https://antifilter.download" &
@@ -192,6 +237,7 @@ v5_main() {
     wait $pid_sub 2>/dev/null || log_w "list_subnet download failed"
     wait $pid_comm 2>/dev/null || log_w "list_community download failed"
 
+    # Загрузка последовательно (экономит RAM и надежнее)
     v5_load_batch "vpn_ip"
     v5_load_batch "vpn_subnets"
     v5_load_batch "vpn_community"
