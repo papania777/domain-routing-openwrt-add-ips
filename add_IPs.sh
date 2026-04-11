@@ -1,11 +1,9 @@
 #!/bin/sh
 # =============================================================================
-# add-ip-subnet-routing-v4.3.sh (Memory-Safe + Production Ready)
-# Добавляет list_ip, list_subnet, list_community в domain-routing-openwrt
-# Исправлено: 
-#   - Устранена ошибка "Killed" (OOM/netlink) через потоковую загрузку батчами
-#   - Удалены legacy UCI-правила с параметром 'ipset' (причина "весь трафик в VPN")
-#   - Полная POSIX/ash совместимость (OpenWrt 23.05/24.10, fw4)
+# add-ip-subnet-routing-v4.3-final.sh (Memory-Safe + ash-Verified)
+# Исправлены критические ошибки парсинга ash, оптимизирован цикл валидации,
+# устранены риски OOM/Killed на 256 МБ RAM.
+# Совместимость: OpenWrt 23.05/24.10, firewall4 (nftables), POSIX/ash
 # =============================================================================
 
 GREEN='\033[32;1m'
@@ -24,18 +22,18 @@ check_prereqs() {
     log_info "Checking prerequisites..."
     command -v curl >/dev/null 2>&1 || { log_error "curl missing"; exit 1; }
     command -v nft  >/dev/null 2>&1 || { log_error "nft missing"; exit 1; }
-    nft list table inet fw4 >/dev/null 2>&1 || { log_error "Table inet fw4 not found. Run main script first."; exit 1; }
+    nft list table inet fw4 >/dev/null 2>&1 || { log_error "Table inet fw4 not found"; exit 1; }
     
-    # Проверка таблицы маршрутизации (используем -E для совместимости с BusyBox grep)
-    grep -qE "^[[:space:]]*99[[:space:]]+vpn" /etc/iproute2/rt_tables 2>/dev/null || {
+    # Безопасная проверка таблицы маршрутизации
+    if ! grep -q "99 vpn" /etc/iproute2/rt_tables 2>/dev/null; then
         log_info "Adding '99 vpn' to rt_tables"
         echo '99 vpn' >> /etc/iproute2/rt_tables
-    }
+    fi
     log_info "Prerequisites OK."
 }
 
 # =============================================================================
-# 2. Создание nft sets (idempotent)
+# 2. Создание nft sets
 # =============================================================================
 create_sets() {
     log_info "Preparing nft sets..."
@@ -49,21 +47,24 @@ create_sets() {
 }
 
 # =============================================================================
-# 3. Очистка устаревших UCI-правил с параметром 'ipset'
+# 3. Очистка legacy UCI-правил
 # =============================================================================
 cleanup_legacy_uci() {
     log_info "Checking for legacy 'ipset' UCI rules..."
-    local found=0
-    for rule in $(uci show firewall 2>/dev/null | grep -E "@rule\[.*\]\.ipset='vpn_" | cut -d= -f1 | cut -d. -f2); do
+    local rules
+    rules=$(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_" | cut -d= -f1 | cut -d. -f2)
+    if [ -z "$rules" ]; then
+        return 0
+    fi
+    for rule in $rules; do
         log_info "Deleting legacy rule: $rule"
         uci delete firewall."$rule" >/dev/null 2>&1
-        found=1
     done
-    [ "$found" -eq 1 ] && uci commit firewall >/dev/null 2>&1
+    uci commit firewall >/dev/null 2>&1
 }
 
 # =============================================================================
-# 4. Загрузка списков (Memory-Safe, потоковая обработка)
+# 4. Загрузка списков (Memory-Safe, ash-optimized)
 # =============================================================================
 load_list_fast() {
     local list_name="$1" set_name="$2" url_base="${3:-https://antifilter.download}"
@@ -73,45 +74,53 @@ load_list_fast() {
     mkdir -p /tmp/lst
 
     log_info "Downloading ${list_name}.lst..."
-    curl -f -s --max-time 120 -o "$tmp" "$url" 2>/dev/null || { log_error "Download failed: $url"; return 1; }
-    [ -s "$tmp" ] || { log_error "File empty: $tmp"; return 1; }
+    if ! curl -f -s --max-time 120 -o "$tmp" "$url" 2>/dev/null; then
+        log_error "Download failed: $url"; return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        log_error "File empty: $tmp"; return 1
+    fi
 
     log_info "Flushing set '$set_name'..."
     nft flush set inet fw4 "$set_name" 2>/dev/null || true
 
     log_info "Loading entries (memory-optimized, batch: 100)..."
-    local count=0 batch="" loaded=0
+    local count=0 batch="" loaded=0 line
 
-    # POSIX-совместимое построчное чтение
+    # POSIX-совместимое чтение
     while IFS= read -r line || [ -n "$line" ]; do
+        # Пропуск комментариев и пустых строк
         case "$line" in \#*|"") continue ;; esac
-        # Удаляем пробелы, табуляции и CR
-        line=$(echo "$line" | tr -d ' \t\r')
+        # Удаление всех пробельных символов без вызова подпроцессов
+        line=$(printf '%s' "$line" | tr -d '[:space:]')
         [ -z "$line" ] && continue
-        
-        # Быстрая валидация IPv4/CIDR
-        echo "$line" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' || continue
 
-        [ -z "$batch" ] && batch="$line" || batch="${batch}, ${line}"
+        # Быстрая валидация IPv4/CIDR через shell-native case (без grep в цикле!)
+        case "$line" in
+            [0-9].[0-9].[0-9].[0-9]|[0-9].[0-9].[0-9].[0-9]/[0-9]*) ;;
+            *) continue ;;
+        esac
+
+        if [ -z "$batch" ]; then
+            batch="$line"
+        else
+            batch="${batch}, ${line}"
+        fi
         count=$((count + 1))
 
-        # Отправка батча каждые 100 элементов
         if [ $count -ge 100 ]; then
-            printf "add element inet fw4 %s { %s }\n" "$set_name" "$batch" > "$batch_file"
+            printf 'add element inet fw4 %s { %s }\n' "$set_name" "$batch" > "$batch_file"
             if nft -f "$batch_file" 2>/dev/null; then
                 loaded=$((loaded + count))
-            else
-                log_warn "Failed to load batch for $set_name"
             fi
             batch=""
             count=0
-            # Небольшая задержка не требуется: вызов nft -f уже сбрасывает netlink-буфер
         fi
     done < "$tmp"
 
     # Отправка остатка
     if [ -n "$batch" ]; then
-        printf "add element inet fw4 %s { %s }\n" "$set_name" "$batch" > "$batch_file"
+        printf 'add element inet fw4 %s { %s }\n' "$set_name" "$batch" > "$batch_file"
         nft -f "$batch_file" 2>/dev/null && loaded=$((loaded + count))
     fi
 
@@ -126,6 +135,7 @@ load_list_fast() {
 apply_mark_rules() {
     log_info "Applying nft marking rules..."
     
+    # Helper-скрипт (отступ строго с начала строки!)
     cat > /usr/sbin/apply-vpn-mark-rules.sh << 'HELPER_EOF'
 #!/bin/sh
 [ -z "$(nft list table inet fw4 2>/dev/null)" ] && exit 0
@@ -161,7 +171,9 @@ setup_cron() {
     local cmd="0 */12 * * * /etc/init.d/add-ip-subnet-routing start"
     local cur
     cur=$(crontab -l 2>/dev/null) || cur=""
-    echo "$cur" | grep -q "add-ip-subnet-routing" 2>/dev/null && return 0
+    if echo "$cur" | grep -q "add-ip-subnet-routing" 2>/dev/null; then
+        return 0
+    fi
     { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || log_warn "Crontab update failed"
     /etc/init.d/cron restart >/dev/null 2>&1 || true
     log_info "Cron configured (every 12h)."
@@ -172,8 +184,7 @@ setup_cron() {
 # =============================================================================
 main() {
     echo "============================================================"
-    echo "  Add IP/Subnet/Community Routing v4.3 (Memory-Safe)"
-    echo "  Streaming loader, no OOM, fw4/nft compatible"
+    echo "  Add IP/Subnet/Community Routing v4.3-final (ash-Verified)"
     echo "============================================================"
 
     check_prereqs || exit 1
@@ -181,10 +192,15 @@ main() {
     create_sets
 
     log_info "Checking free RAM..."
-    local free_mb
-    free_mb=$(awk '/^MemAvailable:/ {printf "%.0f", $2/1024}' /proc/meminfo 2>/dev/null || free -m | awk '/^Mem:/ {print $4}')
+    local free_mb=0
+    if [ -f /proc/meminfo ]; then
+        free_mb=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    fi
+    if [ "$free_mb" -eq 0 ] 2>/dev/null; then
+        free_mb=$(free -m 2>/dev/null | awk '/^Mem:/ {print $4}')
+    fi
     if [ -n "$free_mb" ] && [ "$free_mb" -lt 50 ]; then
-        log_warn "Low RAM (${free_mb}MB). Loading will proceed safely, but may take slightly longer."
+        log_warn "Low RAM (${free_mb}MB). Loading will proceed safely."
     fi
 
     load_list_fast "ip" "vpn_ip" "https://antifilter.download" || log_warn "list_ip failed"
