@@ -1,9 +1,11 @@
 #!/bin/sh
 # =============================================================================
-# v8.1-default-dns.sh
-# Unified Domain + IP/Subnet/Community Routing + Sing-Box
-# Перманентный Default DNS, авто-очистка DNSCrypt2/Stubby, ash-совместимость
+# v8.2-autoinstall.sh
+# Unified Routing: Domain + IP/Subnet/Community + Sing-Box
+# Авто-установка в /etc/init.d/, авто-cron, очистка DNSCrypt/Stubby
 # =============================================================================
+
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
 v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
@@ -11,7 +13,49 @@ v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
 v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
 
 # =============================================================================
-# PHASE 1: CLEANUP
+# PHASE 0: SELF-INSTALL & CRON SETUP
+# =============================================================================
+v8_self_install() {
+    v8_log_i "Phase 0: Self-installing & configuring cron..."
+    local v8_init_path="/etc/init.d/v8-unified-routing"
+    local v8_tmp_path="/tmp/v8-install-check.sh"
+    local v8_cron_cmd="0 */12 * * * $v8_init_path start"
+
+    # Если скрипт уже установлен, просто проверяем cron
+    if [ -x "$v8_init_path" ]; then
+        v8_log_i "Script already installed at $v8_init_path"
+    else
+        v8_log_i "Installing script to $v8_init_path..."
+        if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
+            sed -i 's/\r$//' "$v8_tmp_path"
+            if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
+                cp "$v8_tmp_path" "$v8_init_path"
+                chmod +x "$v8_init_path"
+                rm -f "$v8_tmp_path"
+                "$v8_init_path" enable 2>/dev/null || true
+                v8_log_i "✅ Installed & enabled successfully."
+            else
+                v8_log_w "Downloaded file is invalid. Skipping auto-install."
+                rm -f "$v8_tmp_path"
+            fi
+        else
+            v8_log_w "Failed to download script. Manual install required later."
+        fi
+    fi
+
+    # Настройка cron (идемпотентна)
+    local v8_cur=$(crontab -l 2>/dev/null) || v8_cur=""
+    if echo "$v8_cur" | grep -q "v8-unified-routing start" 2>/dev/null; then
+        v8_log_i "Cron job already configured."
+    else
+        { echo "$v8_cur"; echo "$v8_cron_cmd"; } | crontab - 2>/dev/null || v8_log_w "Failed to update crontab"
+        /etc/init.d/cron restart >/dev/null 2>&1 || true
+        v8_log_i "✅ Cron job set: $v8_cron_cmd"
+    fi
+}
+
+# =============================================================================
+# PHASE 1: GENERAL CLEANUP
 # =============================================================================
 v8_cleanup() {
     v8_log_i "Phase 1: General cleanup..."
@@ -21,7 +65,7 @@ v8_cleanup() {
         uci delete firewall."$v8_r" >/dev/null 2>&1
     done
     uci commit firewall >/dev/null 2>&1
-    rm -f /usr/sbin/v8-mark-rules.sh /etc/init.d/getdomains /etc/init.d/add-ip-subnet-routing
+    rm -f /usr/sbin/v8-mark-rules.sh
     rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft
     v8_log_i "General cleanup done."
 }
@@ -58,37 +102,28 @@ v8_validate() {
 }
 
 # =============================================================================
-# PHASE 3.5: CLEANUP LEGACY DNS RESOLVERS (DNSCrypt2 / Stubby)
+# PHASE 3.5: CLEANUP LEGACY DNS RESOLVERS
 # =============================================================================
 v8_cleanup_dns() {
     v8_log_i "Phase 3.5: Cleaning up legacy DNS resolvers..."
     v8_dns_cleaned=0
-
-    # DNSCrypt2
     if command -v dnscrypt-proxy >/dev/null 2>&1 || opkg list-installed | grep -q dnscrypt-proxy2; then
-        v8_log_i "Stopping & disabling DNSCrypt2..."
         /etc/init.d/dnscrypt-proxy stop 2>/dev/null || true
         /etc/init.d/dnscrypt-proxy disable 2>/dev/null || true
         v8_dns_cleaned=1
     fi
-
-    # Stubby
     if command -v stubby >/dev/null 2>&1 || opkg list-installed | grep -q stubby; then
-        v8_log_i "Stopping & disabling Stubby..."
         /etc/init.d/stubby stop 2>/dev/null || true
         /etc/init.d/stubby disable 2>/dev/null || true
         v8_dns_cleaned=1
     fi
-
-    # Restore default dnsmasq behavior (use upstream DNS from /etc/resolv.conf)
     if [ "$v8_dns_cleaned" -eq 1 ] || uci get dhcp.@dnsmasq[0].noresolv 2>/dev/null | grep -q "1"; then
-        v8_log_i "Restoring default dnsmasq DNS settings..."
         uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null || true
         uci del dhcp.@dnsmasq[0].server 2>/dev/null || true
         uci commit dhcp 2>/dev/null || true
         /etc/init.d/dnsmasq restart 2>/dev/null || true
+        v8_log_i "Default DNS restored."
     fi
-    v8_log_i "DNS resolution set to Default (system upstream)."
 }
 
 # =============================================================================
@@ -101,20 +136,16 @@ v8_setup_domains() {
         cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && cp /etc/config/dhcp /etc/config/dhcp-old && mv /etc/config/dhcp-opkg /etc/config/dhcp
-        v8_log_i "dnsmasq-full installed."
     fi
-
     uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
     uci commit dhcp 2>/dev/null
     mkdir -p /tmp/dnsmasq.d
 
     v8_dom_url="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
     v8_dom_file="/tmp/dnsmasq.d/domains.lst"
-    
     if curl -f -s --max-time 120 -o "$v8_dom_file" "$v8_dom_url" 2>/dev/null && [ -s "$v8_dom_file" ]; then
         if dnsmasq --conf-file="$v8_dom_file" --test 2>&1 | grep -q "syntax check OK"; then
-            /etc/init.d/dnsmasq stop 2>/dev/null
-            /etc/init.d/dnsmasq start 2>/dev/null
+            /etc/init.d/dnsmasq stop 2>/dev/null; /etc/init.d/dnsmasq start 2>/dev/null
             sleep 3
             grep -oE 'nftset=/[^/]+/' "$v8_dom_file" 2>/dev/null | head -3 | sed 's|nftset=/||; s|/||' | while read v8_d; do
                 [ -n "$v8_d" ] && nslookup "$v8_d" 127.0.0.1 >/dev/null 2>&1 &
@@ -180,7 +211,7 @@ v8_setup_singbox() {
 }
 
 # =============================================================================
-# PHASE 7: LOAD IP LISTS (PARALLEL + BATCH)
+# PHASE 7: LOAD IP LISTS
 # =============================================================================
 v8_load_list() {
     v8_ln="$1"; v8_ls="$2"; v8_lb="${3:-https://antifilter.download}"
@@ -235,7 +266,6 @@ for v8c in prerouting output; do
 done
 HELPER
     chmod +x "$v8_hp"
-
     if ! uci show firewall 2>/dev/null | grep -q "v8-mark-rules"; then
         uci add firewall include >/dev/null 2>&1
         uci set firewall.@include[-1].type='script'
@@ -243,7 +273,6 @@ HELPER
         uci set firewall.@include[-1].reload='1'
         uci commit firewall >/dev/null 2>&1
     fi
-
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     sleep 2
     "$v8_hp"
@@ -251,7 +280,7 @@ HELPER
 }
 
 # =============================================================================
-# PHASE 9: ROUTE & CRON
+# PHASE 9: ROUTE
 # =============================================================================
 v8_setup_route() {
     v8_log_i "Phase 9: Route setup..."
@@ -261,13 +290,6 @@ v8_setup_route() {
     else
         v8_log_w "tun0 not up yet. Hotplug will add route later."
     fi
-}
-v8_cron() {
-    v8_cmd="0 */12 * * * /etc/init.d/v8-unified-routing start"
-    v8_cur=$(crontab -l 2>/dev/null) || v8_cur=""
-    echo "$v8_cur" | grep -q "v8-unified-routing" 2>/dev/null && return 0
-    { echo "$v8_cur"; echo "$v8_cmd"; } | crontab - 2>/dev/null || v8_log_w "Crontab update failed"
-    /etc/init.d/cron restart >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -282,7 +304,6 @@ v8_diagnose() {
     v8_dc=0
     [ -s /tmp/dnsmasq.d/domains.lst ] && v8_dc=$(grep -c "^nftset=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
     printf "\n%-20s %s domains (nftset lines)\n" "Domains list:" "$v8_dc"
-    
     echo -e "\n=== MARKING RULES ==="
     v8_rc=$(nft list ruleset 2>/dev/null | grep -c "v8_")
     echo "Found: $v8_rc rules"
@@ -294,6 +315,9 @@ v8_diagnose() {
     if nslookup google.com 127.0.0.1 >/dev/null 2>&1; then echo "✅ Works"; else echo "❌ Failed"; fi
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -2
+    echo -e "\n=== CRON & INIT ==="
+    crontab -l 2>/dev/null | grep "v8-unified" || echo "Not in cron"
+    [ -x /etc/init.d/v8-unified-routing ] && echo "✅ Installed in init.d" || echo "❌ Not installed"
 }
 
 # =============================================================================
@@ -301,25 +325,23 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.1 (Default DNS + Domain/IP Routing)"
+    echo "  Unified Routing v8.2 (Auto-Install + Cron + Domain/IP)"
     echo "============================================================"
+    v8_self_install    # <-- АВТО-УСТАНОВКА И CRON
     v8_create_sets
     v8_cleanup
     v8_validate
-    v8_cleanup_dns        # <-- НОВАЯ ФАЗА: очистка DNSCrypt/Stubby
+    v8_cleanup_dns
     v8_setup_domains
     v8_setup_fw
     v8_setup_singbox
     v8_load_all
     v8_apply_rules
     v8_setup_route
-    v8_cron
     v8_diagnose
     echo "============================================================"
-    v8_log_i "DONE. DNS set to Default. Domain IPs populate on first query."
-    v8_log_i "To save for auto-start, run:"
-    v8_log_i "  wget -q -L -O /tmp/v8.sh <SCRIPT_URL> && sed -i 's/\\r\$//' /tmp/v8.sh"
-    v8_log_i "  cp /tmp/v8.sh /etc/init.d/v8-unified-routing && chmod +x /etc/init.d/v8-unified-routing"
+    v8_log_i "DONE. Script auto-installed. Routing active."
+    echo "Manage service: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
     echo "============================================================"
 }
 
