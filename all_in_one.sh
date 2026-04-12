@@ -1,8 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v8.6-tun-permissions.sh
+# v8.7-boot-order-fix.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: TUN permissions (root user + disable ujail), crash loop fix
+# ИСПРАВЛЕНО: Порядок запуска при буте, проверка готовности, логирование
 # =============================================================================
 
 V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
@@ -11,6 +11,7 @@ v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[
 v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
 v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
 v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
+v8_log_boot() { logger -t "v8-boot" "$1"; }  # <-- Логирование в system log для отладки
 
 # =============================================================================
 # PHASE 0: SELF-INSTALL & CRON
@@ -164,7 +165,11 @@ v8_setup_fw() {
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/30-vpnroute << 'EOF'
 #!/bin/sh
-[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "tun0" ] && sleep 10 && ip route add table vpn default dev tun0
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "tun0" ] && {
+    logger -t "v8-boot" "tun0 came up, adding route"
+    sleep 10
+    ip route add table vpn default dev tun0 2>/dev/null || true
+}
 EOF
     chmod +x /etc/hotplug.d/iface/30-vpnroute
     cp /etc/hotplug.d/iface/30-vpnroute /etc/hotplug.d/net/30-vpnroute 2>/dev/null || true
@@ -235,58 +240,32 @@ v8_install_extended() {
 
 v8_fix_singbox_permissions() {
     v8_log_i "Fixing sing-box permissions for TUN interface..."
-    
-    # Determine service name (podkop or sing-box)
     v8_service="sing-box"
     [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
     
-    # 1. Force user=root (critical for TUN creation)
     if [ -f "/etc/config/$v8_service" ]; then
-        # Check if user is set to sing-box and change to root
         if grep -q "option user 'sing-box'" "/etc/config/$v8_service" 2>/dev/null; then
             sed -i "s/option user 'sing-box'/option user 'root'/" "/etc/config/$v8_service" 2>/dev/null
-            v8_log_i "Changed user to 'root' in /etc/config/$v8_service"
         fi
-        # Ensure enabled=1
         uci set "$v8_service.@$v8_service[0].enabled"='1' 2>/dev/null || true
-        uci commit "$v8_service" 2>/dev/null || true
-    fi
-    
-    # 2. Disable ujail limits if present (OpenWrt 24.10+)
-    if [ -f "/etc/config/$v8_service" ]; then
-        # Remove file limits that block TUN
         uci del "$v8_service.@$v8_service[0].nofilelimit" 2>/dev/null || true
         uci del "$v8_service.@$v8_service[0].norlimit" 2>/dev/null || true
         uci commit "$v8_service" 2>/dev/null || true
-        v8_log_i "Disabled ujail limits for $v8_service"
     fi
-    
-    # 3. Ensure binary has proper permissions
-    chmod +x /usr/bin/sing-box 2>/dev/null || true
     chmod 755 /usr/bin/sing-box 2>/dev/null || true
-    
-    # 4. Reset crash loop counter in procd
     /etc/init.d/$v8_service stop 2>/dev/null || true
-    sleep 1
-    # Clear procd instance state
     rm -f /var/run/$v8_service.* 2>/dev/null || true
 }
 
 v8_setup_singbox() {
     v8_log_i "Phase 6: Sing-Box setup & validation..."
-    # 1. Base package
     if ! opkg list-installed | grep -q sing-box; then
         opkg update >/dev/null 2>&1
         opkg install sing-box >/dev/null 2>&1 || { v8_log_e "sing-box package failed"; exit 1; }
     fi
-
-    # 2. Install Extended
     v8_install_extended
-
-    # 3. Fix permissions BEFORE starting
     v8_fix_singbox_permissions
 
-    # 4. Config handling
     if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
         cat > /etc/sing-box/config.json << 'SBEOF'
@@ -297,10 +276,8 @@ SBEOF
         v8_log_i "Existing config preserved."
     fi
 
-    # 5. Validate
-    sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || v8_log_w "Config check failed. Check /etc/sing-box/config.json"
+    sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || v8_log_w "Config check failed."
 
-    # 6. Start via init
     v8_service="sing-box"
     [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
     
@@ -309,17 +286,14 @@ SBEOF
     /etc/init.d/$v8_service start 2>/dev/null || true
     sleep 3
 
-    # 7. Fallback: direct binary start if procd failed
     if ! ps | grep -v grep | grep -q "sing-box.*run"; then
         v8_log_w "Init script didn't spawn process. Starting directly as root..."
         killall sing-box 2>/dev/null || true
         sleep 1
-        # Run in background with proper env
         nohup /usr/bin/sing-box run -c /etc/sing-box/config.json >/tmp/sb-stdout.log 2>/tmp/sb-stderr.log &
         v8_log_i "✅ Direct process started (PID: $!)"
     fi
 
-    # 8. Wait for tun0
     v8_tun_wait=0
     while [ $v8_tun_wait -lt 30 ]; do
         if ip link show tun0 >/dev/null 2>&1; then
@@ -331,8 +305,6 @@ SBEOF
     done
     v8_log_e "tun0 not created after 30s. Check logs:"
     [ -s /tmp/sb-stderr.log ] && cat /tmp/sb-stderr.log | head -15
-    [ -s /tmp/sb-stdout.log ] && cat /tmp/sb-stdout.log | head -10
-    v8_log_e "Manual test: /usr/bin/sing-box run -c /etc/sing-box/config.json"
 }
 
 # =============================================================================
@@ -375,7 +347,7 @@ v8_load_all() {
 }
 
 # =============================================================================
-# PHASE 8: APPLY RULES & PERSISTENCE
+# PHASE 8: APPLY RULES & PERSISTENCE (WITH BOOT ORDER FIX)
 # =============================================================================
 v8_apply_rules() {
     v8_log_i "Phase 8: Firewall reload & marking rules..."
@@ -398,22 +370,44 @@ HELPER
         uci set firewall.@include[-1].reload='1'
         uci commit firewall >/dev/null 2>&1
     fi
+    
+    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ждём готовности перед применением правил
+    v8_log_boot "Waiting for sets to be populated..."
+    v8_ready_wait=0
+    while [ $v8_ready_wait -lt 60 ]; do
+        v8_domains_cnt=$(nft list set inet fw4 vpn_domains 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
+        v8_ip_cnt=$(nft list set inet fw4 vpn_ip 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
+        if [ "$v8_ip_cnt" -gt 1000 ] && [ "$v8_domains_cnt" -gt 0 ]; then
+            v8_log_boot "Sets ready: domains=$v8_domains_cnt, ip=$v8_ip_cnt"
+            break
+        fi
+        sleep 1
+        v8_ready_wait=$((v8_ready_wait + 1))
+    done
+    
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
-    sleep 2
+    sleep 3
+    
+    # 🔑 Явно применяем правила после reload
     "$v8_hp"
     v8_log_i "Marking rules active & persistent."
+    v8_log_boot "Marking rules applied after firewall reload"
 }
 
 # =============================================================================
-# PHASE 9: ROUTE
+# PHASE 9: ROUTE (WITH BOOT ORDER FIX)
 # =============================================================================
 v8_setup_route() {
     v8_log_i "Phase 9: Route setup..."
+    
+    # 🔑 Если tun0 уже есть — добавляем маршрут сразу
     if ip link show tun0 >/dev/null 2>&1; then
-        ip route del table vpn default 2>/dev/null
+        ip route del table vpn default 2>/dev/null || true
         ip route add table vpn default dev tun0 2>/dev/null && v8_log_i "Route: default dev tun0 table vpn"
+        v8_log_boot "Route added: default dev tun0 table vpn"
     else
-        v8_log_w "tun0 still missing. Route skipped. Check sing-box logs."
+        v8_log_w "tun0 not ready yet. Hotplug will add route when interface comes up."
+        v8_log_boot "tun0 not ready, relying on hotplug"
     fi
 }
 
@@ -429,6 +423,7 @@ v8_diagnose() {
     v8_dc=0
     [ -s /tmp/dnsmasq.d/domains.lst ] && v8_dc=$(grep -c "^nftset=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
     printf "\n%-20s %s domains (nftset lines)\n" "Domains list:" "$v8_dc"
+    
     echo -e "\n=== MARKING RULES ==="
     v8_rc=$(nft list ruleset 2>/dev/null | grep -c "v8_")
     echo "Found: $v8_rc rules"
@@ -447,14 +442,17 @@ v8_diagnose() {
     echo -e "\n=== CRON & INIT ==="
     crontab -l 2>/dev/null | grep "v8-unified" || echo "❌ Not in cron"
     [ -x /etc/init.d/v8-unified-routing ] && echo "✅ Installed in init.d" || echo "❌ Not installed"
+    echo -e "\n=== BOOT LOGS (last 10) ==="
+    logread | grep "v8-boot" | tail -10 || echo "No boot logs found"
 }
 
 # =============================================================================
 # MAIN
 # =============================================================================
 v8_main() {
+    v8_log_boot "=== Script start ==="
     echo "============================================================"
-    echo "  Unified Routing v8.6 (Fixed TUN Permissions + Cron)"
+    echo "  Unified Routing v8.7 (Boot Order Fix + Logging)"
     echo "============================================================"
     v8_self_install
     v8_create_sets
@@ -468,11 +466,28 @@ v8_main() {
     v8_apply_rules
     v8_setup_route
     v8_diagnose
+    v8_log_boot "=== Script end ==="
     echo "============================================================"
     v8_log_i "DONE. All components active. Routing ready."
     echo "Manage: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
+    echo "Debug: logread | grep v8-boot"
     echo "============================================================"
 }
+
+# =============================================================================
+# INIT SCRIPT INTERFACE (for /etc/init.d/)
+# =============================================================================
+# Этот блок позволяет скрипту работать как init-скрипт с правильным приоритетом
+if [ "${1:-}" = "boot" ] || [ -x /etc/rc.common ] && /etc/rc.common boot; then
+    # При загрузке системы: ждём готовности сети перед запуском
+    v8_log_boot "Boot mode: waiting for network..."
+    for v8_i in 1 2 3 4 5; do
+        if ip link show lo >/dev/null 2>&1; then break; fi
+        sleep 2
+    done
+    v8_main
+    exit 0
+fi
 
 v8_cmd="${1:-start}"
 case "$v8_cmd" in
