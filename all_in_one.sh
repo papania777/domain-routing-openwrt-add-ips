@@ -1,8 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v8.5-stable-sb.sh
+# v8.6-tun-permissions.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: UCI enabled flag, fallback запуск, cron, ash-совместимость
+# ИСПРАВЛЕНО: TUN permissions (root user + disable ujail), crash loop fix
 # =============================================================================
 
 V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
@@ -40,7 +40,6 @@ v8_self_install() {
         fi
     fi
 
-    # Cron setup (fixed for empty crontab)
     /etc/init.d/cron enable 2>/dev/null || true
     if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
         v8_cur=$(crontab -l 2>/dev/null || true)
@@ -193,7 +192,7 @@ EOF
 }
 
 # =============================================================================
-# PHASE 6: SING-BOX & EXTENDED (FIXED)
+# PHASE 6: SING-BOX & EXTENDED (FIXED TUN PERMISSIONS)
 # =============================================================================
 v8_install_extended() {
     v8_log_i "Installing/Updating sing-box-extended..."
@@ -234,6 +233,45 @@ v8_install_extended() {
     cd /
 }
 
+v8_fix_singbox_permissions() {
+    v8_log_i "Fixing sing-box permissions for TUN interface..."
+    
+    # Determine service name (podkop or sing-box)
+    v8_service="sing-box"
+    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
+    
+    # 1. Force user=root (critical for TUN creation)
+    if [ -f "/etc/config/$v8_service" ]; then
+        # Check if user is set to sing-box and change to root
+        if grep -q "option user 'sing-box'" "/etc/config/$v8_service" 2>/dev/null; then
+            sed -i "s/option user 'sing-box'/option user 'root'/" "/etc/config/$v8_service" 2>/dev/null
+            v8_log_i "Changed user to 'root' in /etc/config/$v8_service"
+        fi
+        # Ensure enabled=1
+        uci set "$v8_service.@$v8_service[0].enabled"='1' 2>/dev/null || true
+        uci commit "$v8_service" 2>/dev/null || true
+    fi
+    
+    # 2. Disable ujail limits if present (OpenWrt 24.10+)
+    if [ -f "/etc/config/$v8_service" ]; then
+        # Remove file limits that block TUN
+        uci del "$v8_service.@$v8_service[0].nofilelimit" 2>/dev/null || true
+        uci del "$v8_service.@$v8_service[0].norlimit" 2>/dev/null || true
+        uci commit "$v8_service" 2>/dev/null || true
+        v8_log_i "Disabled ujail limits for $v8_service"
+    fi
+    
+    # 3. Ensure binary has proper permissions
+    chmod +x /usr/bin/sing-box 2>/dev/null || true
+    chmod 755 /usr/bin/sing-box 2>/dev/null || true
+    
+    # 4. Reset crash loop counter in procd
+    /etc/init.d/$v8_service stop 2>/dev/null || true
+    sleep 1
+    # Clear procd instance state
+    rm -f /var/run/$v8_service.* 2>/dev/null || true
+}
+
 v8_setup_singbox() {
     v8_log_i "Phase 6: Sing-Box setup & validation..."
     # 1. Base package
@@ -245,13 +283,8 @@ v8_setup_singbox() {
     # 2. Install Extended
     v8_install_extended
 
-    # 3. 🚨 CRITICAL: Force enable in UCI (fixes "active with no instances")
-    if [ -f /etc/config/sing-box ]; then
-        uci set sing-box.@sing-box[0].enabled='1' 2>/dev/null || true
-        uci commit sing-box 2>/dev/null || true
-    fi
-    v8_service="sing-box"
-    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
+    # 3. Fix permissions BEFORE starting
+    v8_fix_singbox_permissions
 
     # 4. Config handling
     if [ ! -f /etc/sing-box/config.json ]; then
@@ -268,23 +301,27 @@ SBEOF
     sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || v8_log_w "Config check failed. Check /etc/sing-box/config.json"
 
     # 6. Start via init
+    v8_service="sing-box"
+    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
+    
     /etc/init.d/$v8_service stop 2>/dev/null || true
-    sleep 1
-    /etc/init.d/$v8_service start 2>/dev/null || true
     sleep 2
+    /etc/init.d/$v8_service start 2>/dev/null || true
+    sleep 3
 
     # 7. Fallback: direct binary start if procd failed
-    if ! ps | grep -v grep | grep -q "sing-box"; then
-        v8_log_w "Init script didn't spawn process. Starting directly..."
+    if ! ps | grep -v grep | grep -q "sing-box.*run"; then
+        v8_log_w "Init script didn't spawn process. Starting directly as root..."
         killall sing-box 2>/dev/null || true
         sleep 1
-        sing-box run -c /etc/sing-box/config.json >/tmp/sb-stdout.log 2>/tmp/sb-stderr.log &
-        v8_log_i "✅ Direct process started."
+        # Run in background with proper env
+        nohup /usr/bin/sing-box run -c /etc/sing-box/config.json >/tmp/sb-stdout.log 2>/tmp/sb-stderr.log &
+        v8_log_i "✅ Direct process started (PID: $!)"
     fi
 
     # 8. Wait for tun0
     v8_tun_wait=0
-    while [ $v8_tun_wait -lt 20 ]; do
+    while [ $v8_tun_wait -lt 30 ]; do
         if ip link show tun0 >/dev/null 2>&1; then
             v8_log_i "✅ Sing-Box running. tun0 interface created."
             return 0
@@ -292,9 +329,10 @@ SBEOF
         sleep 1
         v8_tun_wait=$((v8_tun_wait + 1))
     done
-    v8_log_e "tun0 not created. Check logs:"
-    [ -s /tmp/sb-stderr.log ] && cat /tmp/sb-stderr.log | head -10
-    v8_log_e "Run manually: sing-box run -c /etc/sing-box/config.json"
+    v8_log_e "tun0 not created after 30s. Check logs:"
+    [ -s /tmp/sb-stderr.log ] && cat /tmp/sb-stderr.log | head -15
+    [ -s /tmp/sb-stdout.log ] && cat /tmp/sb-stdout.log | head -10
+    v8_log_e "Manual test: /usr/bin/sing-box run -c /etc/sing-box/config.json"
 }
 
 # =============================================================================
@@ -400,6 +438,10 @@ v8_diagnose() {
     ip route show table vpn 2>/dev/null || echo "Empty"
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -3
+    echo -e "\n=== SING-BOX PROCESS ==="
+    ps | grep -v grep | grep sing-box || echo "No sing-box process found"
+    echo -e "\n=== TUN INTERFACE ==="
+    ip link show tun0 2>/dev/null || echo "tun0 not found"
     echo -e "\n=== DNS TEST ==="
     if nslookup google.com 127.0.0.1 >/dev/null 2>&1; then echo "✅ Works"; else echo "❌ Failed"; fi
     echo -e "\n=== CRON & INIT ==="
@@ -412,7 +454,7 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.5 (Fixed SB + tun0 + Cron)"
+    echo "  Unified Routing v8.6 (Fixed TUN Permissions + Cron)"
     echo "============================================================"
     v8_self_install
     v8_create_sets
