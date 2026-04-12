@@ -1,8 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v8.0-FINAL.sh
+# v8.1-default-dns.sh
 # Unified Domain + IP/Subnet/Community Routing + Sing-Box
-# Строгий порядок fw4, ash-совместимость, исправлен nftset & persistence
+# Перманентный Default DNS, авто-очистка DNSCrypt2/Stubby, ash-совместимость
 # =============================================================================
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
@@ -14,7 +14,7 @@ v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
 # PHASE 1: CLEANUP
 # =============================================================================
 v8_cleanup() {
-    v8_log_i "Phase 1: Cleanup..."
+    v8_log_i "Phase 1: General cleanup..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v8-unified" | crontab - 2>/dev/null || true
     for v8_r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
@@ -23,14 +23,14 @@ v8_cleanup() {
     uci commit firewall >/dev/null 2>&1
     rm -f /usr/sbin/v8-mark-rules.sh /etc/init.d/getdomains /etc/init.d/add-ip-subnet-routing
     rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft
-    v8_log_i "Cleanup done."
+    v8_log_i "General cleanup done."
 }
 
 # =============================================================================
-# PHASE 2: PRE-CREATE NFT SETS (КРИТИЧНО ДЛЯ dnsmasq nftset)
+# PHASE 2: PRE-CREATE NFT SETS
 # =============================================================================
 v8_create_sets() {
-    v8_log_i "Phase 2: Creating nft sets..."
+    v8_log_i "Phase 2: Pre-creating nft sets..."
     for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do
         nft list set inet fw4 "$v8_s" >/dev/null 2>&1 || \
             nft add set inet fw4 "$v8_s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || \
@@ -58,7 +58,41 @@ v8_validate() {
 }
 
 # =============================================================================
-# PHASE 4: DNSMASQ & DOMAINS (ИСПРАВЛЕНО ПОД ОРИГИНАЛ)
+# PHASE 3.5: CLEANUP LEGACY DNS RESOLVERS (DNSCrypt2 / Stubby)
+# =============================================================================
+v8_cleanup_dns() {
+    v8_log_i "Phase 3.5: Cleaning up legacy DNS resolvers..."
+    v8_dns_cleaned=0
+
+    # DNSCrypt2
+    if command -v dnscrypt-proxy >/dev/null 2>&1 || opkg list-installed | grep -q dnscrypt-proxy2; then
+        v8_log_i "Stopping & disabling DNSCrypt2..."
+        /etc/init.d/dnscrypt-proxy stop 2>/dev/null || true
+        /etc/init.d/dnscrypt-proxy disable 2>/dev/null || true
+        v8_dns_cleaned=1
+    fi
+
+    # Stubby
+    if command -v stubby >/dev/null 2>&1 || opkg list-installed | grep -q stubby; then
+        v8_log_i "Stopping & disabling Stubby..."
+        /etc/init.d/stubby stop 2>/dev/null || true
+        /etc/init.d/stubby disable 2>/dev/null || true
+        v8_dns_cleaned=1
+    fi
+
+    # Restore default dnsmasq behavior (use upstream DNS from /etc/resolv.conf)
+    if [ "$v8_dns_cleaned" -eq 1 ] || uci get dhcp.@dnsmasq[0].noresolv 2>/dev/null | grep -q "1"; then
+        v8_log_i "Restoring default dnsmasq DNS settings..."
+        uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null || true
+        uci del dhcp.@dnsmasq[0].server 2>/dev/null || true
+        uci commit dhcp 2>/dev/null || true
+        /etc/init.d/dnsmasq restart 2>/dev/null || true
+    fi
+    v8_log_i "DNS resolution set to Default (system upstream)."
+}
+
+# =============================================================================
+# PHASE 4: DNSMASQ & DOMAIN ROUTING
 # =============================================================================
 v8_setup_domains() {
     v8_log_i "Phase 4: DNSmasq & Domain Routing..."
@@ -82,7 +116,6 @@ v8_setup_domains() {
             /etc/init.d/dnsmasq stop 2>/dev/null
             /etc/init.d/dnsmasq start 2>/dev/null
             sleep 3
-            # Триггер резолва для заполнения vpn_domains
             grep -oE 'nftset=/[^/]+/' "$v8_dom_file" 2>/dev/null | head -3 | sed 's|nftset=/||; s|/||' | while read v8_d; do
                 [ -n "$v8_d" ] && nslookup "$v8_d" 127.0.0.1 >/dev/null 2>&1 &
             done
@@ -137,11 +170,11 @@ EOF
 v8_setup_singbox() {
     v8_log_i "Phase 6: Sing-Box..."
     command -v sing-box >/dev/null 2>&1 || { opkg update >/dev/null 2>&1; opkg install sing-box >/dev/null 2>&1 || exit 1; }
-    [ ! -f /etc/sing-box/config.json ] && {
+    if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
         printf '{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true}}\n' > /etc/sing-box/config.json
         v8_log_i "Sing-box config created. EDIT outbounds TO SET YOUR PROXY!"
-    }
+    fi
     /etc/init.d/sing-box enable 2>/dev/null
     /etc/init.d/sing-box restart 2>/dev/null
 }
@@ -186,12 +219,10 @@ v8_load_all() {
 }
 
 # =============================================================================
-# PHASE 8: APPLY RULES & PERSISTENCE (КЛЮЧЕВОЙ ИСПРАВЛЕННЫЙ ЭТАП)
+# PHASE 8: APPLY RULES & PERSISTENCE
 # =============================================================================
 v8_apply_rules() {
     v8_log_i "Phase 8: Firewall reload & marking rules..."
-    
-    # 1. Создаём helper-скрипт (строго без отступов перед EOF)
     v8_hp="/usr/sbin/v8-mark-rules.sh"
     cat > "$v8_hp" << 'HELPER'
 #!/bin/sh
@@ -205,7 +236,6 @@ done
 HELPER
     chmod +x "$v8_hp"
 
-    # 2. Регистрируем в UCI ДО reload, чтобы fw4 выполнил его автоматически
     if ! uci show firewall 2>/dev/null | grep -q "v8-mark-rules"; then
         uci add firewall include >/dev/null 2>&1
         uci set firewall.@include[-1].type='script'
@@ -214,11 +244,8 @@ HELPER
         uci commit firewall >/dev/null 2>&1
     fi
 
-    # 3. Выполняем reload (fw4 перестроит таблицы И запустит наш include)
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     sleep 2
-    
-    # 4. Запускаем явно для гарантии
     "$v8_hp"
     v8_log_i "Marking rules active & persistent."
 }
@@ -274,11 +301,12 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.0-FINAL (Domain + IP/Subnet/Community)"
+    echo "  Unified Routing v8.1 (Default DNS + Domain/IP Routing)"
     echo "============================================================"
     v8_create_sets
     v8_cleanup
     v8_validate
+    v8_cleanup_dns        # <-- НОВАЯ ФАЗА: очистка DNSCrypt/Stubby
     v8_setup_domains
     v8_setup_fw
     v8_setup_singbox
@@ -288,10 +316,9 @@ v8_main() {
     v8_cron
     v8_diagnose
     echo "============================================================"
-    v8_log_i "DONE. Domain IPs populate on first DNS query."
-    v8_log_i "To save for auto-start, run EXACTLY these commands:"
-    v8_log_i "  wget -q -L -O /tmp/v8.sh <SCRIPT_URL>"
-    v8_log_i "  sed -i 's/\\r\$//' /tmp/v8.sh"
+    v8_log_i "DONE. DNS set to Default. Domain IPs populate on first query."
+    v8_log_i "To save for auto-start, run:"
+    v8_log_i "  wget -q -L -O /tmp/v8.sh <SCRIPT_URL> && sed -i 's/\\r\$//' /tmp/v8.sh"
     v8_log_i "  cp /tmp/v8.sh /etc/init.d/v8-unified-routing && chmod +x /etc/init.d/v8-unified-routing"
     echo "============================================================"
 }
@@ -302,7 +329,7 @@ v8_main() {
 v8_cmd="${1:-start}"
 case "$v8_cmd" in
     start) v8_main ;;
-    clean) v8_cleanup; v8_log_i "Cleanup done." ;;
+    clean) v8_cleanup; v8_cleanup_dns; v8_log_i "Cleanup done." ;;
     stop) for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do nft flush set inet fw4 "$v8_s" 2>/dev/null || true; done ;;
     reload|restart) "$0" stop; sleep 1; "$0" start ;;
     diagnose) v8_diagnose ;;
