@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
-# v6.5-final.sh
-# Unified Routing + Sing-Box (Fixed Reload Wipe & Init Script)
+# v6.6-final-domains.sh
+# Unified Routing + Sing-Box (Fixed Domain Routing & Diagnostics)
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -10,10 +10,10 @@ log_w() { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 log_e() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 # =============================================================================
-# 1. CLEANUP & PRE-CREATE
+# 1. CLEANUP
 # =============================================================================
 v6_cleanup() {
-    log_i "Phase 1: Cleanup & Pre-create sets..."
+    log_i "Phase 1: Cleanup..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v6-unified" | crontab - 2>/dev/null || true
     for r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
@@ -28,10 +28,21 @@ v6_cleanup() {
 }
 
 # =============================================================================
-# 2. VALIDATE
+# 2. PRE-CREATE SETS
+# =============================================================================
+v6_precreate_sets() {
+    log_i "Phase 2: Pre-creating nft sets..."
+    for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
+        nft list set inet fw4 "$s" >/dev/null 2>&1 || \
+            nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+    done
+}
+
+# =============================================================================
+# 3. VALIDATE
 # =============================================================================
 v6_validate() {
-    log_i "Phase 2: Validate system..."
+    log_i "Phase 3: Validate system..."
     command -v curl >/dev/null 2>&1 || { log_e "curl missing"; exit 1; }
     command -v nft  >/dev/null 2>&1 || { log_e "nft missing"; exit 1; }
     grep -q "99 vpn" /etc/iproute2/rt_tables 2>/dev/null || {
@@ -49,10 +60,11 @@ v6_validate() {
 }
 
 # =============================================================================
-# 3. SERVICES (Sing-Box & DNS)
+# 4. SERVICES (Sing-Box & DNS/Domains)
 # =============================================================================
 v6_setup_services() {
-    log_i "Phase 3: Services..."
+    log_i "Phase 4: Services..."
+    # Sing-box
     if ! command -v sing-box >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1
         opkg install sing-box >/dev/null 2>&1 || { log_e "sing-box install failed"; exit 1; }
@@ -69,22 +81,35 @@ SBEOF
     /etc/init.d/sing-box enable 2>/dev/null
     /etc/init.d/sing-box restart 2>/dev/null
 
+    # DNS & Domains
     opkg list-installed | grep -q dnsmasq-full || {
-        opkg update >/dev/null 2>&1; cd /tmp && opkg download dnsmasq-full 2>/dev/null
+        opkg update >/dev/null 2>&1
+        cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && mv /etc/config/dhcp-opkg /etc/config/dhcp
     }
     uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d || {
-        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'; uci commit dhcp
+        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
+        uci commit dhcp
     }
+    
     mkdir -p /tmp/dnsmasq.d
     DOMAINS_URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
     if curl -f -s --max-time 120 -o /tmp/dnsmasq.d/domains.lst "$DOMAINS_URL" 2>/dev/null && [ -s /tmp/dnsmasq.d/domains.lst ]; then
+        # Проверяем синтаксис
         if dnsmasq --conf-file=/tmp/dnsmasq.d/domains.lst --test 2>&1 | grep -q "syntax check OK"; then
             /etc/init.d/dnsmasq restart 2>/dev/null
+            sleep 2
+            
+            # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: триггерим DNS-запросы, чтобы dnsmasq заполнил vpn_domains
+            log_i "Triggering DNS resolution to populate vpn_domains set..."
+            grep -oE '/[a-z0-9.-]+/' /tmp/dnsmasq.d/domains.lst | head -10 | tr -d '/' | while read domain; do
+                ping -c 1 -W 1 "$domain" >/dev/null 2>&1 &
+            done
+            wait
             log_i "Domain list loaded & dnsmasq restarted."
         else
-            log_w "Domain list syntax check failed"
+            log_w "Domain list syntax check failed. Check /tmp/dnsmasq.d/domains.lst"
         fi
     else
         log_w "Failed to download domain list"
@@ -92,10 +117,10 @@ SBEOF
 }
 
 # =============================================================================
-# 4. FIREWALL UCI & HOTPLUG
+# 5. FIREWALL UCI & HOTPLUG
 # =============================================================================
 v6_setup_fw_uci() {
-    log_i "Phase 4: Firewall UCI setup..."
+    log_i "Phase 5: Firewall UCI setup..."
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/30-vpnroute << 'HEOF'
 #!/bin/sh
@@ -127,7 +152,7 @@ HEOF
 }
 
 # =============================================================================
-# 5. LOAD IP LISTS
+# 6. LOAD IP LISTS
 # =============================================================================
 v6_load_list() {
     ln="$1"; ls="$2"; lb="${3:-https://antifilter.download}"
@@ -157,7 +182,7 @@ v6_load_list() {
     log_i "Loaded ~$done into $ls."
 }
 v6_load_all() {
-    log_i "Phase 5: Loading IP lists..."
+    log_i "Phase 6: Loading IP lists..."
     v6_load_list "ip" "vpn_ip" "https://antifilter.download" &
     p1=$!; v6_load_list "subnet" "vpn_subnets" "https://antifilter.download" &
     p2=$!; v6_load_list "community" "vpn_community" "https://community.antifilter.download" &
@@ -166,17 +191,15 @@ v6_load_all() {
 }
 
 # =============================================================================
-# 6. APPLY NFT RULES (AFTER FIREWALL RELOAD!)
+# 7. APPLY NFT RULES (POST-RELOAD)
 # =============================================================================
 v6_apply_rules() {
-    log_i "Phase 7: Applying nft marking rules (post-reload)..."
-    # fw4 создает цепочки prerouting/output. Проверяем и добавляем.
+    log_i "Phase 7: Applying nft marking rules..."
     for chain in prerouting output; do
         for set in vpn_domains vpn_ip vpn_subnets vpn_community; do
-            # Добавляем только если правила еще нет
             if ! nft list chain inet fw4 "$chain" 2>/dev/null | grep -q "v6_${set}_${chain}"; then
                 nft add rule inet fw4 "$chain" ip daddr "@${set}" meta mark set 0x1 comment "v6_${set}_${chain}" 2>/dev/null || \
-                    log_w "Failed to add rule: $set in $chain"
+                    log_w "Failed: $set in $chain"
             fi
         done
     done
@@ -184,7 +207,7 @@ v6_apply_rules() {
 }
 
 # =============================================================================
-# 7. ROUTE & CRON
+# 8. ROUTE & CRON
 # =============================================================================
 v6_setup_route() {
     log_i "Phase 8: Route setup..."
@@ -192,7 +215,7 @@ v6_setup_route() {
         ip route del table vpn default 2>/dev/null
         ip route add table vpn default dev tun0 2>/dev/null && log_i "Route added: default dev tun0 table vpn"
     else
-        log_w "tun0 not up yet. Hotplug will add route when interface comes up."
+        log_w "tun0 not up yet. Hotplug will add route later."
     fi
 }
 
@@ -201,19 +224,25 @@ v6_cron() {
     cmd="0 */12 * * * /etc/init.d/v6-unified-routing start"
     cur=$(crontab -l 2>/dev/null) || cur=""
     echo "$cur" | grep -q "v6-unified-routing" 2>/dev/null && return 0
-    { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || log_w "Failed to update crontab"
+    { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || log_w "Crontab update failed"
     /etc/init.d/cron restart >/dev/null 2>&1 || true
 }
 
 # =============================================================================
-# DIAGNOSTICS
+# DIAGNOSTICS (FIXED COUNTERS & DOMAIN CHECK)
 # =============================================================================
 v6_diagnose() {
     echo "=== NFT SETS (IP COUNT) ==="
     for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        cnt=$(nft list set inet fw4 "$s" 2>/dev/null | grep -E "^\s+[0-9]" | wc -l)
+        cnt=$(nft list set inet fw4 "$s" 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
         printf "%-20s %s IPs\n" "$s:" "$cnt"
     done
+    
+    # Отдельный счётчик доменов из списка (строки server=)
+    dom_count=0
+    [ -s /tmp/dnsmasq.d/domains.lst ] && dom_count=$(grep -c "^server=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
+    printf "\n%-20s %s domains\n" "Domains list:" "$dom_count"
+    
     echo -e "\n=== MARKING RULES ==="
     cnt=$(nft list ruleset 2>/dev/null | grep -c "v6_")
     echo "Found: $cnt rules"
@@ -223,8 +252,8 @@ v6_diagnose() {
     ip route show table vpn 2>/dev/null || echo "Empty"
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -2
-    echo -e "\n=== DOMAINS ==="
-    [ -s /tmp/dnsmasq.d/domains.lst ] && echo "Loaded: $(wc -l < /tmp/dnsmasq.d/domains.lst)" || echo "Not loaded"
+    echo -e "\n=== DNSMASQ LOGS (last 5) ==="
+    logread -e dnsmasq 2>/dev/null | tail -5 || echo "No logs"
 }
 
 # =============================================================================
@@ -232,14 +261,15 @@ v6_diagnose() {
 # =============================================================================
 v6_main() {
     echo "============================================================"
-    echo "  Unified Routing v6.5-Final (Fixed Reload Wipe)"
+    echo "  Unified Routing v6.6 (Fixed Domain Routing)"
     echo "============================================================"
+    
+    v6_precreate_sets
     v6_cleanup
     v6_validate
     v6_setup_services
     v6_setup_fw_uci
     
-    # КРИТИЧЕСКИ ВАЖНО: reload делаем ДО добавления nft-правил
     log_i "Reloading firewall to build chains..."
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     sleep 2
@@ -252,9 +282,8 @@ v6_main() {
     
     v6_diagnose
     echo "============================================================"
-    log_i "DONE. Rules preserved. To install for auto-start:"
-    log_i "  wget -q -O /etc/init.d/v6-unified-routing <YOUR_SCRIPT_URL>"
-    log_i "  chmod +x /etc/init.d/v6-unified-routing"
+    log_i "DONE. Domain IPs populate on first DNS query."
+    log_i "To install for auto-start: wget -O /etc/init.d/v6-unified-routing <URL> && chmod +x /etc/init.d/v6-unified-routing"
     echo "============================================================"
 }
 
