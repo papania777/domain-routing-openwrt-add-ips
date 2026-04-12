@@ -1,8 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v8.4-extended-tun.sh
+# v8.5-stable-sb.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: Интеграция sing-box-extended, ожидание tun0, валидация конфига
+# ИСПРАВЛЕНО: UCI enabled flag, fallback запуск, cron, ash-совместимость
 # =============================================================================
 
 V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
@@ -40,9 +40,12 @@ v8_self_install() {
         fi
     fi
 
+    # Cron setup (fixed for empty crontab)
     /etc/init.d/cron enable 2>/dev/null || true
     if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
-        (crontab -l 2>/dev/null; echo "0 */12 * * * $v8_init_path start") | crontab - 2>/dev/null
+        v8_cur=$(crontab -l 2>/dev/null || true)
+        echo "$v8_cur
+0 */12 * * * $v8_init_path start" | crontab - 2>/dev/null
         /etc/init.d/cron restart 2>/dev/null || true
         v8_log_i "✅ Cron job added (every 12h)"
     fi
@@ -190,7 +193,7 @@ EOF
 }
 
 # =============================================================================
-# PHASE 6: SING-BOX & EXTENDED INSTALL (INTEGRATED + FIXED)
+# PHASE 6: SING-BOX & EXTENDED (FIXED)
 # =============================================================================
 v8_install_extended() {
     v8_log_i "Installing/Updating sing-box-extended..."
@@ -203,7 +206,7 @@ v8_install_extended() {
         aarch64) v8_arch="arm64" ;; armv7*) v8_arch="armv7" ;; armv6*) v8_arch="armv6" ;;
         x86_64) v8_arch="amd64" ;; i386|i686) v8_arch="386" ;; mips) v8_arch="mips-softfloat" ;;
         mipsel|mipsle) v8_arch="mipsle-softfloat" ;; mips64) v8_arch="mips64" ;;
-        mips64el|mips64le) v8_arch="mips64le" ;; riscv64) v8_arch="riscv64" ;; *) v8_log_e "Unsupported arch"; return 1 ;;
+        mips64el|mips64le) v8_arch="mips64le" ;; riscv64) v8_arch="riscv64" ;; s390x) v8_arch="s390x" ;; *) v8_log_e "Unsupported arch"; return 1 ;;
     esac
 
     v8_api="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/latest"
@@ -221,8 +224,8 @@ v8_install_extended() {
     tar -xzf sing-box-ext.tar.gz 2>/dev/null
     v8_bin=$(find . -type f -name sing-box | head -n 1)
     if [ -n "$v8_bin" ]; then
-        /etc/init.d/sing-box stop 2>/dev/null || service sing-box stop 2>/dev/null || true
-        sleep 2
+        killall sing-box 2>/dev/null || true
+        sleep 1
         cp -f "$v8_bin" /usr/bin/sing-box
         chmod +x /usr/bin/sing-box
         v8_log_i "✅ sing-box-extended binary replaced."
@@ -233,16 +236,24 @@ v8_install_extended() {
 
 v8_setup_singbox() {
     v8_log_i "Phase 6: Sing-Box setup & validation..."
-    # 1. Base package (for init scripts)
+    # 1. Base package
     if ! opkg list-installed | grep -q sing-box; then
         opkg update >/dev/null 2>&1
         opkg install sing-box >/dev/null 2>&1 || { v8_log_e "sing-box package failed"; exit 1; }
     fi
 
-    # 2. Install Extended version
+    # 2. Install Extended
     v8_install_extended
 
-    # 3. Config handling (NEVER overwrite existing working config)
+    # 3. 🚨 CRITICAL: Force enable in UCI (fixes "active with no instances")
+    if [ -f /etc/config/sing-box ]; then
+        uci set sing-box.@sing-box[0].enabled='1' 2>/dev/null || true
+        uci commit sing-box 2>/dev/null || true
+    fi
+    v8_service="sing-box"
+    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
+
+    # 4. Config handling
     if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
         cat > /etc/sing-box/config.json << 'SBEOF'
@@ -253,20 +264,27 @@ SBEOF
         v8_log_i "Existing config preserved."
     fi
 
-    # 4. Validate config before start
-    if sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-        v8_log_i "Config syntax OK."
-    else
-        v8_log_w "Config syntax check failed. Sing-box may not start."
+    # 5. Validate
+    sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || v8_log_w "Config check failed. Check /etc/sing-box/config.json"
+
+    # 6. Start via init
+    /etc/init.d/$v8_service stop 2>/dev/null || true
+    sleep 1
+    /etc/init.d/$v8_service start 2>/dev/null || true
+    sleep 2
+
+    # 7. Fallback: direct binary start if procd failed
+    if ! ps | grep -v grep | grep -q "sing-box"; then
+        v8_log_w "Init script didn't spawn process. Starting directly..."
+        killall sing-box 2>/dev/null || true
+        sleep 1
+        sing-box run -c /etc/sing-box/config.json >/tmp/sb-stdout.log 2>/tmp/sb-stderr.log &
+        v8_log_i "✅ Direct process started."
     fi
 
-    # 5. Start service
-    /etc/init.d/sing-box enable 2>/dev/null
-    /etc/init.d/sing-box restart 2>/dev/null || service sing-box restart 2>/dev/null
-
-    # 6. Wait for tun0 (up to 10 seconds)
+    # 8. Wait for tun0
     v8_tun_wait=0
-    while [ $v8_tun_wait -lt 10 ]; do
+    while [ $v8_tun_wait -lt 20 ]; do
         if ip link show tun0 >/dev/null 2>&1; then
             v8_log_i "✅ Sing-Box running. tun0 interface created."
             return 0
@@ -274,7 +292,9 @@ SBEOF
         sleep 1
         v8_tun_wait=$((v8_tun_wait + 1))
     done
-    v8_log_w "tun0 not created after 10s. Check logs: logread | grep sing-box"
+    v8_log_e "tun0 not created. Check logs:"
+    [ -s /tmp/sb-stderr.log ] && cat /tmp/sb-stderr.log | head -10
+    v8_log_e "Run manually: sing-box run -c /etc/sing-box/config.json"
 }
 
 # =============================================================================
@@ -392,7 +412,7 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.4 (Extended SB + tun0 Fix + Cron)"
+    echo "  Unified Routing v8.5 (Fixed SB + tun0 + Cron)"
     echo "============================================================"
     v8_self_install
     v8_create_sets
@@ -401,7 +421,7 @@ v8_main() {
     v8_cleanup_dns
     v8_setup_domains
     v8_setup_fw
-    v8_setup_singbox   # <-- Теперь устанавливает extended, проверяет конфиг и ждёт tun0
+    v8_setup_singbox
     v8_load_all
     v8_apply_rules
     v8_setup_route
