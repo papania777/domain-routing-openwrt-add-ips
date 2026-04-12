@@ -1,11 +1,12 @@
 #!/bin/sh
 # =============================================================================
-# v8.2-autoinstall.sh
+# v8.3-cron-fixed.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box
-# Авто-установка в /etc/init.d/, авто-cron, очистка DNSCrypt/Stubby
+# ИСПРАВЛЕНО: Гарантированное добавление cron, совместимость ash, авто-установка
 # =============================================================================
 
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
+# 🔧 ВНИМАНИЕ: Замените URL на прямую ссылку к вашему raw-файлу на GitHub!
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/add_IPs.sh"
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
 v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
@@ -13,44 +14,32 @@ v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
 v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
 
 # =============================================================================
-# PHASE 0: SELF-INSTALL & CRON SETUP
+# PHASE 0: SELF-INSTALL
 # =============================================================================
 v8_self_install() {
-    v8_log_i "Phase 0: Self-installing & configuring cron..."
-    local v8_init_path="/etc/init.d/v8-unified-routing"
-    local v8_tmp_path="/tmp/v8-install-check.sh"
-    local v8_cron_cmd="0 */12 * * * $v8_init_path start"
+    v8_log_i "Phase 0: Self-installing to /etc/init.d/..."
+    v8_init_path="/etc/init.d/v8-unified-routing"
+    v8_tmp_path="/tmp/v8-install-check.sh"
 
-    # Если скрипт уже установлен, просто проверяем cron
     if [ -x "$v8_init_path" ]; then
-        v8_log_i "Script already installed at $v8_init_path"
-    else
-        v8_log_i "Installing script to $v8_init_path..."
-        if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
-            sed -i 's/\r$//' "$v8_tmp_path"
-            if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
-                cp "$v8_tmp_path" "$v8_init_path"
-                chmod +x "$v8_init_path"
-                rm -f "$v8_tmp_path"
-                "$v8_init_path" enable 2>/dev/null || true
-                v8_log_i "✅ Installed & enabled successfully."
-            else
-                v8_log_w "Downloaded file is invalid. Skipping auto-install."
-                rm -f "$v8_tmp_path"
-            fi
-        else
-            v8_log_w "Failed to download script. Manual install required later."
-        fi
+        v8_log_i "Script already installed."
+        return 0
     fi
 
-    # Настройка cron (идемпотентна)
-    local v8_cur=$(crontab -l 2>/dev/null) || v8_cur=""
-    if echo "$v8_cur" | grep -q "v8-unified-routing start" 2>/dev/null; then
-        v8_log_i "Cron job already configured."
+    if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
+        sed -i 's/\r$//' "$v8_tmp_path"
+        if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
+            cp "$v8_tmp_path" "$v8_init_path"
+            chmod +x "$v8_init_path"
+            rm -f "$v8_tmp_path"
+            "$v8_init_path" enable 2>/dev/null || true
+            v8_log_i "✅ Installed & enabled successfully."
+        else
+            v8_log_w "Downloaded file invalid. Skipping auto-install."
+            rm -f "$v8_tmp_path"
+        fi
     else
-        { echo "$v8_cur"; echo "$v8_cron_cmd"; } | crontab - 2>/dev/null || v8_log_w "Failed to update crontab"
-        /etc/init.d/cron restart >/dev/null 2>&1 || true
-        v8_log_i "✅ Cron job set: $v8_cron_cmd"
+        v8_log_w "Failed to download script. Manual install required later."
     fi
 }
 
@@ -60,6 +49,7 @@ v8_self_install() {
 v8_cleanup() {
     v8_log_i "Phase 1: General cleanup..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
+    # Очищаем cron от старых записей перед настройкой
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v8-unified" | crontab - 2>/dev/null || true
     for v8_r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
         uci delete firewall."$v8_r" >/dev/null 2>&1
@@ -280,7 +270,7 @@ HELPER
 }
 
 # =============================================================================
-# PHASE 9: ROUTE
+# PHASE 9: ROUTE & CRON (ИСПРАВЛЕНО)
 # =============================================================================
 v8_setup_route() {
     v8_log_i "Phase 9: Route setup..."
@@ -289,6 +279,27 @@ v8_setup_route() {
         ip route add table vpn default dev tun0 2>/dev/null && v8_log_i "Route: default dev tun0 table vpn"
     else
         v8_log_w "tun0 not up yet. Hotplug will add route later."
+    fi
+}
+
+v8_setup_cron() {
+    v8_log_i "Phase 10: Configuring auto-update cron..."
+    # 1. Гарантируем включение сервиса cron
+    /etc/init.d/cron enable 2>/dev/null || true
+    
+    # 2. Проверяем наличие задачи
+    if crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
+        v8_log_i "✅ Cron job already configured."
+        return 0
+    fi
+
+    # 3. Безопасное добавление (стандартный паттерн OpenWrt)
+    (crontab -l 2>/dev/null; echo "0 */12 * * * /etc/init.d/v8-unified-routing start") | crontab - 2>/dev/null
+    if [ $? -eq 0 ]; then
+        /etc/init.d/cron restart 2>/dev/null || true
+        v8_log_i "✅ Cron job added (updates every 12h)"
+    else
+        v8_log_w "Failed to update crontab. Add manually: 0 */12 * * * /etc/init.d/v8-unified-routing start"
     fi
 }
 
@@ -316,7 +327,7 @@ v8_diagnose() {
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -2
     echo -e "\n=== CRON & INIT ==="
-    crontab -l 2>/dev/null | grep "v8-unified" || echo "Not in cron"
+    crontab -l 2>/dev/null | grep "v8-unified" || echo "❌ Not in cron"
     [ -x /etc/init.d/v8-unified-routing ] && echo "✅ Installed in init.d" || echo "❌ Not installed"
 }
 
@@ -325,9 +336,9 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.2 (Auto-Install + Cron + Domain/IP)"
+    echo "  Unified Routing v8.3 (Fixed Cron + Auto-Install)"
     echo "============================================================"
-    v8_self_install    # <-- АВТО-УСТАНОВКА И CRON
+    v8_self_install
     v8_create_sets
     v8_cleanup
     v8_validate
@@ -338,9 +349,10 @@ v8_main() {
     v8_load_all
     v8_apply_rules
     v8_setup_route
+    v8_setup_cron    # <-- Отдельная фаза, вызывается в конце
     v8_diagnose
     echo "============================================================"
-    v8_log_i "DONE. Script auto-installed. Routing active."
+    v8_log_i "DONE. Script auto-installed. Cron & Routing active."
     echo "Manage service: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
     echo "============================================================"
 }
