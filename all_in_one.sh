@@ -1,75 +1,81 @@
-#!/bin/sh
+#!/bin/sh /etc/rc.common
 # =============================================================================
-# v8.8-boot-persistent.sh
+# v8.10-init-stable.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: Полная персистентность правил через UCI, порядок загрузки
+# Исправлено: Точная структура /etc/rc.common, интеграция install.sh, логирование
 # =============================================================================
 
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
+START=99
+STOP=95
+
+# 🔧 ВНИМАНИЕ: Замените URL на прямую ссылку к вашему raw-файлу на GitHub!
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/add_IPs.sh"
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
-v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
-v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
-v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
-v8_log_boot() { logger -t "v8-boot" "$1"; }
+v8_log() { logger -t "v8-boot" "$1"; printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
+v8_log_w() { logger -t "v8-boot" "[WARN] $1"; printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
+v8_log_e() { logger -t "v8-boot" "[ERROR] $1"; printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
 
 # =============================================================================
-# INIT SCRIPT HEADER (для /etc/init.d/)
+# INTEGRATED: sing-box-extended install logic (from install.sh)
 # =============================================================================
-# Этот блок делает скрипт полноценным init-скриптом с правильным порядком загрузки
-if [ -x /etc/rc.common ]; then
-    USE_PROCD=1
-    START=99
-    STOP=10
-    REQUIRES="firewall network"
-    EXTRA_COMMANDS="diagnose clean"
-    EXTRA_HELP="	diagnose	Run diagnostics
-	clean	Clean up temporary files"
-fi
-
-# =============================================================================
-# PHASE 0: SELF-INSTALL & CRON
-# =============================================================================
-v8_self_install() {
-    v8_log_i "Phase 0: Self-installing & configuring cron..."
-    v8_init_path="/etc/init.d/v8-unified-routing"
-    v8_tmp_path="/tmp/v8-install-check.sh"
-
-    if [ -x "$v8_init_path" ]; then
-        v8_log_i "Script already installed."
+v8_install_sb_extended() {
+    v8_log "Updating sing-box-extended..."
+    API_URL="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/latest"
+    DEST_FILE="/usr/bin/sing-box"
+    
+    if command -v curl >/dev/null 2>&1; then
+        FETCH="curl -fsSL --insecure"; DOWNLOAD="curl -fsSL --insecure -o"
+    elif command -v wget >/dev/null 2>&1; then
+        FETCH="wget -qO- --no-check-certificate"; DOWNLOAD="wget -q --no-check-certificate -O"
     else
-        if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
-            sed -i 's/\r$//' "$v8_tmp_path"
-            if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
-                cp "$v8_tmp_path" "$v8_init_path"
-                chmod +x "$v8_init_path"
-                rm -f "$v8_tmp_path"
-                "$v8_init_path" enable 2>/dev/null || true
-                v8_log_i "✅ Installed & enabled."
-            else
-                v8_log_w "Invalid download. Skipping auto-install."
-                rm -f "$v8_tmp_path"
-            fi
-        else
-            v8_log_w "Download failed. Manual install required."
-        fi
+        v8_log_e "curl/wget missing"; return 1
     fi
 
-    /etc/init.d/cron enable 2>/dev/null || true
-    if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
-        v8_cur=$(crontab -l 2>/dev/null || true)
-        echo "$v8_cur
-0 */12 * * * $v8_init_path start" | crontab - 2>/dev/null
-        /etc/init.d/cron restart 2>/dev/null || true
-        v8_log_i "✅ Cron job added (every 12h)"
+    SERVICE_NAME="sing-box"
+    [ -f "/etc/init.d/podkop" ] && SERVICE_NAME="podkop"
+
+    HOST_ARCH=$(uname -m)
+    [ -f "/etc/openwrt_release" ] && DISTRIB_ARCH=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH") && \
+        case "$DISTRIB_ARCH" in *mipsel*|*mipsle*) HOST_ARCH="mipsel" ;; *mips64el*|*mips64le*) HOST_ARCH="mips64el" ;; esac
+    
+    case $HOST_ARCH in
+        aarch64) ARCH="arm64" ;; armv7*) ARCH="armv7" ;; armv6*) ARCH="armv6" ;;
+        x86_64) ARCH="amd64" ;; i386|i686) ARCH="386" ;; mips) ARCH="mips-softfloat" ;;
+        mipsel|mipsle) ARCH="mipsle-softfloat" ;; mips64) ARCH="mips64" ;;
+        mips64el|mips64le) ARCH="mips64le" ;; riscv64) ARCH="riscv64" ;; s390x) ARCH="s390x" ;; *) return 1 ;;
+    esac
+
+    API_RESPONSE=$($FETCH "$API_URL" 2>/dev/null) || true
+    [ -z "$API_RESPONSE" ] && { v8_log_w "GitHub API unreachable."; return 0; }
+
+    DOWNLOAD_URL=$(echo "$API_RESPONSE" | tr ',' '\n' | grep "browser_download_url" | grep "linux-$ARCH.tar.gz" | head -n 1 | awk -F '"' '{print $4}')
+    [ -z "$DOWNLOAD_URL" ] && { v8_log_w "No binary for $ARCH."; return 0; }
+
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    WORK_DIR="/tmp/sb-ext-install"
+    rm -rf "$WORK_DIR"; mkdir -p "$WORK_DIR"; cd "$WORK_DIR"
+
+    $DOWNLOAD "sb.tar.gz" "$DOWNLOAD_URL" 2>/dev/null || { cd /; rm -rf "$WORK_DIR"; v8_log_w "Download failed."; return 0; }
+    [ -s "sb.tar.gz" ] || { cd /; rm -rf "$WORK_DIR"; return 0; }
+
+    service "$SERVICE_NAME" stop 2>/dev/null || true
+    sleep 2
+    tar -xzf "sb.tar.gz" 2>/dev/null
+    BINARY_PATH=$(find . -type f -name sing-box | head -n 1)
+    if [ -n "$BINARY_PATH" ]; then
+        mv -f "$BINARY_PATH" "$DEST_FILE" 2>/dev/null
+        chmod +x "$DEST_FILE"
+        v8_log "✅ sing-box-extended binary replaced."
     fi
+    cd /; rm -rf "$WORK_DIR"
+    return 0
 }
 
 # =============================================================================
-# PHASE 1: GENERAL CLEANUP
+# CORE FUNCTIONS
 # =============================================================================
 v8_cleanup() {
-    v8_log_i "Phase 1: General cleanup..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v8-unified" | crontab - 2>/dev/null || true
     for v8_r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
@@ -77,29 +83,20 @@ v8_cleanup() {
     done
     uci commit firewall >/dev/null 2>&1
     rm -f /usr/sbin/v8-mark-rules.sh
-    rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft /tmp/sing-box-*
-    v8_log_i "General cleanup done."
+    rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft /tmp/sb-*
+    v8_log "Cleanup done."
 }
 
-# =============================================================================
-# PHASE 2: PRE-CREATE NFT SETS
-# =============================================================================
 v8_create_sets() {
-    v8_log_i "Phase 2: Pre-creating nft sets..."
-    for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        nft list set inet fw4 "$v8_s" >/dev/null 2>&1 || \
-            nft add set inet fw4 "$v8_s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || \
-            v8_log_e "Failed to create set $v8_s"
+    for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
+        nft list set inet fw4 "$s" >/dev/null 2>&1 || \
+            nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
     done
 }
 
-# =============================================================================
-# PHASE 3: VALIDATE & REPAIR
-# =============================================================================
 v8_validate() {
-    v8_log_i "Phase 3: Validate system..."
-    command -v curl >/dev/null 2>&1 || { v8_log_e "curl missing"; exit 1; }
-    command -v nft  >/dev/null 2>&1 || { v8_log_e "nft missing"; exit 1; }
+    command -v curl >/dev/null 2>&1 || { v8_log_e "curl missing"; return 1; }
+    command -v nft  >/dev/null 2>&1 || { v8_log_e "nft missing"; return 1; }
     sed -i '/^[[:space:]]*99[[:space:]]*vpn/d' /etc/iproute2/rt_tables 2>/dev/null || true
     echo '99 vpn' >> /etc/iproute2/rt_tables
     uci show network 2>/dev/null | grep -q "mark='0x1'" || {
@@ -110,393 +107,174 @@ v8_validate() {
         uci set network.@rule[-1].lookup='vpn'
         uci commit network
     }
+    v8_log "Network rules validated."
 }
 
-# =============================================================================
-# PHASE 3.5: CLEANUP LEGACY DNS RESOLVERS
-# =============================================================================
 v8_cleanup_dns() {
-    v8_log_i "Phase 3.5: Cleaning up legacy DNS resolvers..."
-    v8_dns_cleaned=0
-    if command -v dnscrypt-proxy >/dev/null 2>&1 || opkg list-installed | grep -q dnscrypt-proxy2; then
-        /etc/init.d/dnscrypt-proxy stop 2>/dev/null || true
-        /etc/init.d/dnscrypt-proxy disable 2>/dev/null || true
-        v8_dns_cleaned=1
-    fi
-    if command -v stubby >/dev/null 2>&1 || opkg list-installed | grep -q stubby; then
-        /etc/init.d/stubby stop 2>/dev/null || true
-        /etc/init.d/stubby disable 2>/dev/null || true
-        v8_dns_cleaned=1
-    fi
-    if [ "$v8_dns_cleaned" -eq 1 ] || uci get dhcp.@dnsmasq[0].noresolv 2>/dev/null | grep -q "1"; then
+    v8_cleaned=0
+    command -v dnscrypt-proxy >/dev/null 2>&1 && { /etc/init.d/dnscrypt-proxy stop 2>/dev/null || true; /etc/init.d/dnscrypt-proxy disable 2>/dev/null || true; v8_cleaned=1; }
+    command -v stubby >/dev/null 2>&1 && { /etc/init.d/stubby stop 2>/dev/null || true; /etc/init.d/stubby disable 2>/dev/null || true; v8_cleaned=1; }
+    if [ "$v8_cleaned" -eq 1 ] || uci get dhcp.@dnsmasq[0].noresolv 2>/dev/null | grep -q "1"; then
         uci del dhcp.@dnsmasq[0].noresolv 2>/dev/null || true
         uci del dhcp.@dnsmasq[0].server 2>/dev/null || true
         uci commit dhcp 2>/dev/null || true
         /etc/init.d/dnsmasq restart 2>/dev/null || true
-        v8_log_i "Default DNS restored."
+        v8_log "Default DNS restored."
     fi
 }
 
-# =============================================================================
-# PHASE 4: DNSMASQ & DOMAIN ROUTING
-# =============================================================================
 v8_setup_domains() {
-    v8_log_i "Phase 4: DNSmasq & Domain Routing..."
-    if ! opkg list-installed | grep -q dnsmasq-full; then
-        opkg update >/dev/null 2>&1
-        cd /tmp && opkg download dnsmasq-full 2>/dev/null
+    opkg list-installed | grep -q dnsmasq-full || {
+        opkg update >/dev/null 2>&1; cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && cp /etc/config/dhcp /etc/config/dhcp-old && mv /etc/config/dhcp-opkg /etc/config/dhcp
-    fi
-    uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null
-    uci commit dhcp 2>/dev/null
+    }
+    uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d' 2>/dev/null; uci commit dhcp 2>/dev/null
     mkdir -p /tmp/dnsmasq.d
 
-    v8_dom_url="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
-    v8_dom_file="/tmp/dnsmasq.d/domains.lst"
-    if curl -f -s --max-time 120 -o "$v8_dom_file" "$v8_dom_url" 2>/dev/null && [ -s "$v8_dom_file" ]; then
-        if dnsmasq --conf-file="$v8_dom_file" --test 2>&1 | grep -q "syntax check OK"; then
-            /etc/init.d/dnsmasq stop 2>/dev/null; /etc/init.d/dnsmasq start 2>/dev/null
-            sleep 3
-            grep -oE 'nftset=/[^/]+/' "$v8_dom_file" 2>/dev/null | head -3 | sed 's|nftset=/||; s|/||' | while read v8_d; do
-                [ -n "$v8_d" ] && nslookup "$v8_d" 127.0.0.1 >/dev/null 2>&1 &
-            done
-            wait
-            v8_log_i "Domain routing configured."
-        else
-            v8_log_e "Domain list syntax check FAILED."
-        fi
+    DOM_FILE="/tmp/dnsmasq.d/domains.lst"
+    curl -f -s --max-time 120 -o "$DOM_FILE" "https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst" 2>/dev/null || return 1
+    [ -s "$DOM_FILE" ] || return 1
+    if dnsmasq --conf-file="$DOM_FILE" --test 2>&1 | grep -q "syntax check OK"; then
+        /etc/init.d/dnsmasq stop 2>/dev/null; /etc/init.d/dnsmasq start 2>/dev/null
+        sleep 2
+        grep -oE 'nftset=/[^/]+/' "$DOM_FILE" 2>/dev/null | head -3 | sed 's|nftset=/||; s|/||' | while read d; do [ -n "$d" ] && nslookup "$d" 127.0.0.1 >/dev/null 2>&1 & done; wait
+        v8_log "Domains configured."
     else
-        v8_log_w "Failed to download domain list."
+        v8_log_w "Domain syntax check failed."
     fi
 }
 
-# =============================================================================
-# PHASE 5: FIREWALL UCI & HOTPLUG
-# =============================================================================
 v8_setup_fw() {
-    v8_log_i "Phase 5: Firewall UCI & Hotplug..."
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/30-vpnroute << 'EOF'
 #!/bin/sh
-[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "tun0" ] && {
-    logger -t "v8-boot" "tun0 came up, adding route"
-    sleep 10
-    ip route add table vpn default dev tun0 2>/dev/null || true
-}
+[ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "tun0" ] && { logger -t "v8-boot" "tun0 up, adding route"; sleep 10; ip route add table vpn default dev tun0 2>/dev/null || true; }
 EOF
     chmod +x /etc/hotplug.d/iface/30-vpnroute
     cp /etc/hotplug.d/iface/30-vpnroute /etc/hotplug.d/net/30-vpnroute 2>/dev/null || true
 
     uci show firewall | grep -q "@zone.*name='singbox'" || {
-        uci add firewall zone
-        uci set firewall.@zone[-1].name='singbox'
-        uci set firewall.@zone[-1].device='tun0'
-        uci set firewall.@zone[-1].forward='ACCEPT'
-        uci set firewall.@zone[-1].output='ACCEPT'
-        uci set firewall.@zone[-1].input='ACCEPT'
-        uci set firewall.@zone[-1].masq='1'
-        uci set firewall.@zone[-1].mtu_fix='1'
-        uci set firewall.@zone[-1].family='ipv4'
+        uci add firewall zone; uci set firewall.@zone[-1].name='singbox'; uci set firewall.@zone[-1].device='tun0'
+        uci set firewall.@zone[-1].forward='ACCEPT'; uci set firewall.@zone[-1].output='ACCEPT'; uci set firewall.@zone[-1].input='ACCEPT'
+        uci set firewall.@zone[-1].masq='1'; uci set firewall.@zone[-1].mtu_fix='1'; uci set firewall.@zone[-1].family='ipv4'
         uci commit firewall
     }
     uci show firewall | grep -q "@forwarding.*name='singbox-lan'" || {
-        uci add firewall forwarding
-        uci set firewall.@forwarding[-1].name='singbox-lan'
-        uci set firewall.@forwarding[-1].dest='singbox'
-        uci set firewall.@forwarding[-1].src='lan'
-        uci set firewall.@forwarding[-1].family='ipv4'
+        uci add firewall forwarding; uci set firewall.@forwarding[-1].name='singbox-lan'
+        uci set firewall.@forwarding[-1].dest='singbox'; uci set firewall.@forwarding[-1].src='lan'; uci set firewall.@forwarding[-1].family='ipv4'
         uci commit firewall
     }
 }
 
-# =============================================================================
-# PHASE 6: SING-BOX & EXTENDED (FIXED TUN PERMISSIONS)
-# =============================================================================
-v8_install_extended() {
-    v8_log_i "Installing/Updating sing-box-extended..."
-    v8_host_arch=$(uname -m)
-    if [ -f "/etc/openwrt_release" ]; then
-        v8_dist_arch=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH")
-        case "$v8_dist_arch" in *mipsel*|*mipsle*) v8_host_arch="mipsel" ;; *mips64el*|*mips64le*) v8_host_arch="mips64el" ;; esac
-    fi
-    case $v8_host_arch in
-        aarch64) v8_arch="arm64" ;; armv7*) v8_arch="armv7" ;; armv6*) v8_arch="armv6" ;;
-        x86_64) v8_arch="amd64" ;; i386|i686) v8_arch="386" ;; mips) v8_arch="mips-softfloat" ;;
-        mipsel|mipsle) v8_arch="mipsle-softfloat" ;; mips64) v8_arch="mips64" ;;
-        mips64el|mips64le) v8_arch="mips64le" ;; riscv64) v8_arch="riscv64" ;; s390x) v8_arch="s390x" ;; *) v8_log_e "Unsupported arch"; return 1 ;;
-    esac
-
-    v8_api="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/latest"
-    v8_res=$(curl -fsSL --insecure "$v8_api" 2>/dev/null || wget -qO- --no-check-certificate "$v8_api" 2>/dev/null)
-    [ -z "$v8_res" ] && { v8_log_w "GitHub API unreachable. Using existing binary."; return 0; }
-
-    v8_url=$(echo "$v8_res" | grep "browser_download_url" | grep "linux-$v8_arch.tar.gz" | head -1 | awk -F '"' '{print $4}')
-    [ -z "$v8_url" ] && { v8_log_w "No binary for $v8_arch. Keeping current."; return 0; }
-
-    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-    cd /tmp
-    curl -fsSL --insecure -o sing-box-ext.tar.gz "$v8_url" 2>/dev/null || wget -q --no-check-certificate -O sing-box-ext.tar.gz "$v8_url" 2>/dev/null
-    [ -s sing-box-ext.tar.gz ] || { v8_log_w "Download failed"; return 0; }
-
-    tar -xzf sing-box-ext.tar.gz 2>/dev/null
-    v8_bin=$(find . -type f -name sing-box | head -n 1)
-    if [ -n "$v8_bin" ]; then
-        killall sing-box 2>/dev/null || true
-        sleep 1
-        cp -f "$v8_bin" /usr/bin/sing-box
-        chmod +x /usr/bin/sing-box
-        v8_log_i "✅ sing-box-extended binary replaced."
-    fi
-    rm -f sing-box-ext.tar.gz && rm -rf ./sing-box*
-    cd /
-}
-
-v8_fix_singbox_permissions() {
-    v8_log_i "Fixing sing-box permissions for TUN interface..."
-    v8_service="sing-box"
-    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
-    
-    if [ -f "/etc/config/$v8_service" ]; then
-        if grep -q "option user 'sing-box'" "/etc/config/$v8_service" 2>/dev/null; then
-            sed -i "s/option user 'sing-box'/option user 'root'/" "/etc/config/$v8_service" 2>/dev/null
-        fi
-        uci set "$v8_service.@$v8_service[0].enabled"='1' 2>/dev/null || true
-        uci del "$v8_service.@$v8_service[0].nofilelimit" 2>/dev/null || true
-        uci del "$v8_service.@$v8_service[0].norlimit" 2>/dev/null || true
-        uci commit "$v8_service" 2>/dev/null || true
-    fi
-    chmod 755 /usr/bin/sing-box 2>/dev/null || true
-    /etc/init.d/$v8_service stop 2>/dev/null || true
-    rm -f /var/run/$v8_service.* 2>/dev/null || true
-}
-
 v8_setup_singbox() {
-    v8_log_i "Phase 6: Sing-Box setup & validation..."
-    if ! opkg list-installed | grep -q sing-box; then
-        opkg update >/dev/null 2>&1
-        opkg install sing-box >/dev/null 2>&1 || { v8_log_e "sing-box package failed"; exit 1; }
-    fi
-    v8_install_extended
-    v8_fix_singbox_permissions
-
-    if [ ! -f /etc/sing-box/config.json ]; then
-        mkdir -p /etc/sing-box
-        cat > /etc/sing-box/config.json << 'SBEOF'
-{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true}}
-SBEOF
-        v8_log_i "Default config created. EDIT outbounds TO SET YOUR PROXY!"
-    else
-        v8_log_i "Existing config preserved."
-    fi
-
-    sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || v8_log_w "Config check failed."
-
-    v8_service="sing-box"
-    [ -f "/etc/init.d/podkop" ] && v8_service="podkop"
+    opkg list-installed | grep -q sing-box || { opkg update >/dev/null 2>&1; opkg install sing-box >/dev/null 2>&1; }
+    v8_install_sb_extended
     
-    /etc/init.d/$v8_service stop 2>/dev/null || true
-    sleep 2
-    /etc/init.d/$v8_service start 2>/dev/null || true
-    sleep 3
-
+    if [ -f "/etc/config/sing-box" ]; then
+        sed -i "s/option user 'sing-box'/option user 'root'/" /etc/config/sing-box 2>/dev/null || true
+        uci set sing-box.@sing-box[0].enabled='1' 2>/dev/null || true
+        uci del sing-box.@sing-box[0].nofilelimit 2>/dev/null || true
+        uci del sing-box.@sing-box[0].norlimit 2>/dev/null || true
+        uci commit sing-box 2>/dev/null || true
+    fi
+    
+    SVC="sing-box"; [ -f "/etc/init.d/podkop" ] && SVC="podkop"
+    [ ! -f /etc/sing-box/config.json ] && { mkdir -p /etc/sing-box; printf '{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true}}\n' > /etc/sing-box/config.json; }
+    sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1 || true
+    
+    /etc/init.d/$SVC stop 2>/dev/null || true; sleep 1; /etc/init.d/$SVC start 2>/dev/null || true
     if ! ps | grep -v grep | grep -q "sing-box.*run"; then
-        v8_log_w "Init script didn't spawn process. Starting directly as root..."
-        killall sing-box 2>/dev/null || true
-        sleep 1
+        killall sing-box 2>/dev/null || true; sleep 1
         nohup /usr/bin/sing-box run -c /etc/sing-box/config.json >/tmp/sb-stdout.log 2>/tmp/sb-stderr.log &
-        v8_log_i "✅ Direct process started (PID: $!)"
     fi
-
-    v8_tun_wait=0
-    while [ $v8_tun_wait -lt 30 ]; do
-        if ip link show tun0 >/dev/null 2>&1; then
-            v8_log_i "✅ Sing-Box running. tun0 interface created."
-            return 0
-        fi
-        sleep 1
-        v8_tun_wait=$((v8_tun_wait + 1))
-    done
-    v8_log_e "tun0 not created after 30s. Check logs:"
-    [ -s /tmp/sb-stderr.log ] && cat /tmp/sb-stderr.log | head -15
+    
+    w=0; while [ $w -lt 40 ]; do ip link show tun0 >/dev/null 2>&1 && { v8_log "✅ tun0 ready."; return 0; }; sleep 1; w=$((w+1)); done
+    v8_log_w "tun0 not created after 40s. Check /etc/sing-box/config.json"
 }
 
-# =============================================================================
-# PHASE 7: LOAD IP LISTS
-# =============================================================================
-v8_load_list() {
-    v8_ln="$1"; v8_ls="$2"; v8_lb="${3:-https://antifilter.download}"
-    v8_lu="${v8_lb}/list/${v8_ln}.lst"; v8_lt="/tmp/lst/${v8_ls}.lst"
-    mkdir -p /tmp/lst
-    curl -f -s --max-time 120 -o "$v8_lt" "$v8_lu" 2>/dev/null || return 1
-    [ -s "$v8_lt" ] || return 1
-    nft flush set inet fw4 "$v8_ls" 2>/dev/null || true
-    sed 's/\r//g' "$v8_lt" | grep -oE '[0-9.]+(/[0-9]{1,2})?' | sort -u > /tmp/lst/${v8_ls}.valid 2>/dev/null || true
-    [ -s /tmp/lst/${v8_ls}.valid ] || return 1
-    v8_cnt=0; v8_b=""; v8_done=0
-    while IFS= read -r v8_l; do
-        [ -z "$v8_l" ] && continue
-        [ -z "$v8_b" ] && v8_b="$v8_l" || v8_b="${v8_b}, ${v8_l}"
-        v8_cnt=$((v8_cnt+1))
-        if [ "$v8_cnt" -ge 500 ]; then
-            printf 'add element inet fw4 %s { %s }\n' "$v8_ls" "$v8_b" > /tmp/v8_batch.nft
-            nft -f /tmp/v8_batch.nft 2>/dev/null && v8_done=$((v8_done+v8_cnt))
-            v8_b=""; v8_cnt=0
-        fi
-    done < /tmp/lst/${v8_ls}.valid
-    if [ -n "$v8_b" ]; then
-        printf 'add element inet fw4 %s { %s }\n' "$v8_ls" "$v8_b" > /tmp/v8_batch.nft
-        nft -f /tmp/v8_batch.nft 2>/dev/null && v8_done=$((v8_done+v8_cnt))
-    fi
-    rm -f "$v8_lt" /tmp/lst/${v8_ls}.valid /tmp/v8_batch.nft
-    v8_log_i "Loaded ~$v8_done into $v8_ls."
-}
 v8_load_all() {
-    v8_log_i "Phase 7: Loading IP lists..."
-    v8_load_list "ip" "vpn_ip" "https://antifilter.download" &
-    v8_p1=$!; v8_load_list "subnet" "vpn_subnets" "https://antifilter.download" &
-    v8_p2=$!; v8_load_list "community" "vpn_community" "https://community.antifilter.download" &
-    v8_p3=$!
-    wait $v8_p1 $v8_p2 $v8_p3 2>/dev/null
+    v8_log "Loading IP lists..."
+    for pair in "ip:vpn_ip:https://antifilter.download" "subnet:vpn_subnets:https://antifilter.download" "community:vpn_community:https://community.antifilter.download"; do
+        ln="${pair%%:*}"; rest="${pair#*:}"; ls="${rest%%:*}"; lb="${rest#*:}"
+        lt="/tmp/lst/${ls}.lst"; mkdir -p /tmp/lst
+        curl -f -s --max-time 120 -o "$lt" "${lb}/list/${ln}.lst" 2>/dev/null || continue
+        [ -s "$lt" ] || continue
+        nft flush set inet fw4 "$ls" 2>/dev/null || true
+        sed 's/\r//g' "$lt" | grep -oE '[0-9.]+(/[0-9]{1,2})?' | sort -u > /tmp/lst/${ls}.valid 2>/dev/null || true
+        [ -s /tmp/lst/${ls}.valid ] || continue
+        cnt=0; b=""; done=0
+        while IFS= read -r l; do
+            [ -z "$l" ] && continue; [ -z "$b" ] && b="$l" || b="${b}, ${l}"
+            cnt=$((cnt+1))
+            if [ "$cnt" -ge 500 ]; then
+                printf 'add element inet fw4 %s { %s }\n' "$ls" "$b" > /tmp/v8_batch.nft
+                nft -f /tmp/v8_batch.nft 2>/dev/null && done=$((done+cnt)); b=""; cnt=0
+            fi
+        done < /tmp/lst/${ls}.valid
+        [ -n "$b" ] && printf 'add element inet fw4 %s { %s }\n' "$ls" "$b" > /tmp/v8_batch.nft && nft -f /tmp/v8_batch.nft 2>/dev/null && done=$((done+cnt))
+        rm -f "$lt" /tmp/lst/${ls}.valid /tmp/v8_batch.nft
+    done
+    v8_log "IP lists loaded."
 }
 
-# =============================================================================
-# PHASE 8: APPLY RULES & PERSISTENCE (UCI-BASED, BOOT-PERSISTENT)
-# =============================================================================
 v8_apply_rules() {
-    v8_log_i "Phase 8: Registering persistent marking rules via UCI..."
-    
-    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: регистрируем правила в UCI ДО применения
-    # Это гарантирует, что они восстановятся после любого firewall reload
-    
-    # Helper-скрипт для восстановления правил (будет вызван fw4 при reload)
-    v8_hp="/usr/sbin/v8-mark-rules.sh"
-    cat > "$v8_hp" << 'HELPER'
+    hp="/usr/sbin/v8-mark-rules.sh"
+    cat > "$hp" << 'HELPER'
 #!/bin/sh
 [ -z "$(nft list table inet fw4 2>/dev/null)" ] && exit 0
-for v8c in prerouting output; do
-    for v8s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        nft list chain inet fw4 "$v8c" 2>/dev/null | grep -q "v8_${v8s}_${v8c}" || \
-            nft add rule inet fw4 "$v8c" ip daddr "@$v8s" meta mark set 0x1 comment "v8_${v8s}_${v8c}" 2>/dev/null || true
+for c in prerouting output; do
+    for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
+        nft list chain inet fw4 "$c" 2>/dev/null | grep -q "v8_${s}_${c}" || \
+            nft add rule inet fw4 "$c" ip daddr "@$s" meta mark set 0x1 comment "v8_${s}_${c}" 2>/dev/null || true
     done
 done
 HELPER
-    chmod +x "$v8_hp"
-
-    # Регистрируем helper в UCI firewall как include с reload='1'
-    # Это гарантирует выполнение после любого firewall reload
-    if ! uci show firewall 2>/dev/null | grep -q "v8-mark-rules"; then
-        uci add firewall include >/dev/null 2>&1
-        uci set firewall.@include[-1].type='script'
-        uci set firewall.@include[-1].path="$v8_hp"
-        uci set firewall.@include[-1].reload='1'
-        uci commit firewall >/dev/null 2>&1
-        v8_log_boot "Registered v8-mark-rules in UCI firewall"
-    fi
-
-    # 🔑 Ждём готовности сетов перед применением правил
-    v8_log_boot "Waiting for sets to be populated..."
-    v8_ready_wait=0
-    while [ $v8_ready_wait -lt 60 ]; do
-        v8_domains_cnt=$(nft list set inet fw4 vpn_domains 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
-        v8_ip_cnt=$(nft list set inet fw4 vpn_ip 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
-        if [ "$v8_ip_cnt" -gt 1000 ] && [ "$v8_domains_cnt" -gt 0 ]; then
-            v8_log_boot "Sets ready: domains=$v8_domains_cnt, ip=$v8_ip_cnt"
-            break
-        fi
-        sleep 1
-        v8_ready_wait=$((v8_ready_wait + 1))
+    chmod +x "$hp"
+    uci show firewall 2>/dev/null | grep -q "v8-mark-rules" || {
+        uci add firewall include >/dev/null 2>&1; uci set firewall.@include[-1].type='script'
+        uci set firewall.@include[-1].path="$hp"; uci set firewall.@include[-1].reload='1'; uci commit firewall >/dev/null 2>&1
+    }
+    
+    v8_log "Waiting for sets..."; w=0
+    while [ $w -lt 60 ]; do
+        ip=$(nft list set inet fw4 vpn_ip 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
+        [ "$ip" -gt 1000 ] && break; sleep 1; w=$((w+1))
     done
     
-    # 🔑 Сначала reload firewall (чтобы он увидел наш include), потом применяем правила
-    /etc/init.d/firewall reload >/dev/null 2>&1 || true
-    sleep 3
-    
-    # Явно применяем правила после reload (для первого запуска)
-    "$v8_hp"
-    v8_log_i "Marking rules active & persistent via UCI."
-    v8_log_boot "Marking rules applied after firewall reload"
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true; sleep 2
+    "$hp"
+    v8_log "Marking rules persistent via UCI."
 }
 
-# =============================================================================
-# PHASE 9: ROUTE (UCI-BASED, BOOT-PERSISTENT)
-# =============================================================================
 v8_setup_route() {
-    v8_log_i "Phase 9: Route setup via UCI..."
-    
-    # 🔑 Добавляем маршрут через UCI network, а не напрямую
-    # Это гарантирует сохранение после перезагрузки
-    if ! uci show network 2>/dev/null | grep -q "vpn_route_default"; then
-        uci set network.vpn_route_default=route >/dev/null 2>&1
-        uci set network.vpn_route_default.name='vpn-default' >/dev/null 2>&1
-        uci set network.vpn_route_default.interface='tun0' >/dev/null 2>&1
-        uci set network.vpn_route_default.table='vpn' >/dev/null 2>&1
-        uci set network.vpn_route_default.target='0.0.0.0/0' >/dev/null 2>&1
-        uci commit network >/dev/null 2>&1
-        v8_log_boot "Added UCI route: default via tun0 table vpn"
-    fi
-    
-    # Если tun0 уже активен — добавляем маршрут сразу (для первого запуска)
     if ip link show tun0 >/dev/null 2>&1; then
         ip route del table vpn default 2>/dev/null || true
-        ip route add table vpn default dev tun0 2>/dev/null && v8_log_i "Route: default dev tun0 table vpn"
-        v8_log_boot "Route added immediately: default dev tun0 table vpn"
-    else
-        v8_log_w "tun0 not ready yet. UCI route will be applied when interface comes up."
-        v8_log_boot "tun0 not ready, relying on UCI route + hotplug"
+        ip route add table vpn default dev tun0 2>/dev/null && v8_log "Route added: default dev tun0 table vpn"
+    fi
+    if ! uci show network 2>/dev/null | grep -q "vpn_route_default"; then
+        uci set network.vpn_route_default=route >/dev/null 2>&1; uci set network.vpn_route_default.name='vpn-default' >/dev/null 2>&1
+        uci set network.vpn_route_default.interface='tun0' >/dev/null 2>&1; uci set network.vpn_route_default.table='vpn' >/dev/null 2>&1
+        uci set network.vpn_route_default.target='0.0.0.0/0' >/dev/null 2>&1; uci commit network >/dev/null 2>&1
+    fi
+}
+
+v8_setup_cron() {
+    /etc/init.d/cron enable 2>/dev/null || true
+    if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
+        (crontab -l 2>/dev/null || true; echo "0 */12 * * * /etc/init.d/v8-unified-routing start") | crontab - 2>/dev/null
+        /etc/init.d/cron restart 2>/dev/null || true
+        v8_log "✅ Cron configured."
     fi
 }
 
 # =============================================================================
-# DIAGNOSTICS
-# =============================================================================
-v8_diagnose() {
-    echo "=== NFT SETS (IP COUNT) ==="
-    for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        v8_cnt=$(nft list set inet fw4 "$v8_s" 2>/dev/null | grep -cE "^\s+[0-9]" || echo 0)
-        printf "%-20s %s IPs\n" "$v8_s:" "$v8_cnt"
-    done
-    v8_dc=0
-    [ -s /tmp/dnsmasq.d/domains.lst ] && v8_dc=$(grep -c "^nftset=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
-    printf "\n%-20s %s domains (nftset lines)\n" "Domains list:" "$v8_dc"
-    
-    echo -e "\n=== MARKING RULES ==="
-    v8_rc=$(nft list ruleset 2>/dev/null | grep -c "v8_")
-    echo "Found: $v8_rc rules"
-    echo -e "\n=== UCI FIREWALL INCLUDE ==="
-    uci show firewall 2>/dev/null | grep "v8-mark-rules" || echo "Not registered"
-    echo -e "\n=== IP RULE ==="
-    ip rule 2>/dev/null | grep "0x1" || echo "Not found"
-    echo -e "\n=== VPN ROUTE (UCI) ==="
-    uci show network 2>/dev/null | grep "vpn_route_default" || echo "Not in UCI"
-    echo -e "\n=== VPN ROUTE (active) ==="
-    ip route show table vpn 2>/dev/null || echo "Empty"
-    echo -e "\n=== SING-BOX ==="
-    /etc/init.d/sing-box status 2>&1 | head -3
-    echo -e "\n=== SING-BOX PROCESS ==="
-    ps | grep -v grep | grep sing-box || echo "No sing-box process found"
-    echo -e "\n=== TUN INTERFACE ==="
-    ip link show tun0 2>/dev/null || echo "tun0 not found"
-    echo -e "\n=== DNS TEST ==="
-    if nslookup google.com 127.0.0.1 >/dev/null 2>&1; then echo "✅ Works"; else echo "❌ Failed"; fi
-    echo -e "\n=== CRON & INIT ==="
-    crontab -l 2>/dev/null | grep "v8-unified" || echo "❌ Not in cron"
-    [ -x /etc/init.d/v8-unified-routing ] && echo "✅ Installed in init.d" || echo "❌ Not installed"
-    echo -e "\n=== BOOT LOGS (last 10) ==="
-    logread | grep "v8-boot" | tail -10 || echo "No boot logs found"
-}
-
-# =============================================================================
-# MAIN
+# MAIN ENTRY
 # =============================================================================
 v8_main() {
-    v8_log_boot "=== Script start ==="
-    echo "============================================================"
-    echo "  Unified Routing v8.8 (Boot-Persistent via UCI)"
-    echo "============================================================"
-    v8_self_install
-    v8_create_sets
+    v8_log "=== Script start ==="
     v8_cleanup
+    v8_create_sets
     v8_validate
     v8_cleanup_dns
     v8_setup_domains
@@ -505,45 +283,13 @@ v8_main() {
     v8_load_all
     v8_apply_rules
     v8_setup_route
-    v8_diagnose
-    v8_log_boot "=== Script end ==="
-    echo "============================================================"
-    v8_log_i "DONE. All components active. Routing ready."
-    echo "Manage: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
-    echo "Debug: logread | grep v8-boot"
-    echo "============================================================"
+    v8_setup_cron
+    v8_log "=== Script end ==="
 }
 
 # =============================================================================
-# INIT SCRIPT INTERFACE (for /etc/init.d/)
+# OPENWRT INIT INTERFACE
 # =============================================================================
-start_service() {
-    v8_main
-}
-
-stop_service() {
-    v8_log_boot "Stopping: clearing sets..."
-    for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        nft flush set inet fw4 "$v8_s" 2>/dev/null || true
-    done
-}
-
-reload_service() {
-    stop_service
-    sleep 1
-    start_service
-}
-
-# Обработка вызовов как init-скрипта
-case "${1:-}" in
-    start) start_service ;;
-    stop) stop_service ;;
-    reload|restart) reload_service ;;
-    diagnose) v8_diagnose ;;
-    clean) v8_cleanup; v8_cleanup_dns; v8_log_i "Cleanup done." ;;
-    *) 
-        # Если вызван не как init-скрипт — выполняем main
-        v8_main
-        ;;
-esac
-exit 0
+start() { v8_main; }
+stop() { v8_log "Stopping..."; for s in vpn_domains vpn_ip vpn_subnets vpn_community; do nft flush set inet fw4 "$s" 2>/dev/null || true; done; }
+restart() { stop; sleep 2; start; }
