@@ -1,8 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v8.7-boot-order-fix.sh
+# v8.8-boot-persistent.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: Порядок запуска при буте, проверка готовности, логирование
+# ИСПРАВЛЕНО: Полная персистентность правил через UCI, порядок загрузки
 # =============================================================================
 
 V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
@@ -11,7 +11,21 @@ v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[
 v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
 v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
 v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
-v8_log_boot() { logger -t "v8-boot" "$1"; }  # <-- Логирование в system log для отладки
+v8_log_boot() { logger -t "v8-boot" "$1"; }
+
+# =============================================================================
+# INIT SCRIPT HEADER (для /etc/init.d/)
+# =============================================================================
+# Этот блок делает скрипт полноценным init-скриптом с правильным порядком загрузки
+if [ -x /etc/rc.common ]; then
+    USE_PROCD=1
+    START=99
+    STOP=10
+    REQUIRES="firewall network"
+    EXTRA_COMMANDS="diagnose clean"
+    EXTRA_HELP="	diagnose	Run diagnostics
+	clean	Clean up temporary files"
+fi
 
 # =============================================================================
 # PHASE 0: SELF-INSTALL & CRON
@@ -347,10 +361,15 @@ v8_load_all() {
 }
 
 # =============================================================================
-# PHASE 8: APPLY RULES & PERSISTENCE (WITH BOOT ORDER FIX)
+# PHASE 8: APPLY RULES & PERSISTENCE (UCI-BASED, BOOT-PERSISTENT)
 # =============================================================================
 v8_apply_rules() {
-    v8_log_i "Phase 8: Firewall reload & marking rules..."
+    v8_log_i "Phase 8: Registering persistent marking rules via UCI..."
+    
+    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: регистрируем правила в UCI ДО применения
+    # Это гарантирует, что они восстановятся после любого firewall reload
+    
+    # Helper-скрипт для восстановления правил (будет вызван fw4 при reload)
     v8_hp="/usr/sbin/v8-mark-rules.sh"
     cat > "$v8_hp" << 'HELPER'
 #!/bin/sh
@@ -363,15 +382,19 @@ for v8c in prerouting output; do
 done
 HELPER
     chmod +x "$v8_hp"
+
+    # Регистрируем helper в UCI firewall как include с reload='1'
+    # Это гарантирует выполнение после любого firewall reload
     if ! uci show firewall 2>/dev/null | grep -q "v8-mark-rules"; then
         uci add firewall include >/dev/null 2>&1
         uci set firewall.@include[-1].type='script'
         uci set firewall.@include[-1].path="$v8_hp"
         uci set firewall.@include[-1].reload='1'
         uci commit firewall >/dev/null 2>&1
+        v8_log_boot "Registered v8-mark-rules in UCI firewall"
     fi
-    
-    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: ждём готовности перед применением правил
+
+    # 🔑 Ждём готовности сетов перед применением правил
     v8_log_boot "Waiting for sets to be populated..."
     v8_ready_wait=0
     while [ $v8_ready_wait -lt 60 ]; do
@@ -385,29 +408,42 @@ HELPER
         v8_ready_wait=$((v8_ready_wait + 1))
     done
     
+    # 🔑 Сначала reload firewall (чтобы он увидел наш include), потом применяем правила
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     sleep 3
     
-    # 🔑 Явно применяем правила после reload
+    # Явно применяем правила после reload (для первого запуска)
     "$v8_hp"
-    v8_log_i "Marking rules active & persistent."
+    v8_log_i "Marking rules active & persistent via UCI."
     v8_log_boot "Marking rules applied after firewall reload"
 }
 
 # =============================================================================
-# PHASE 9: ROUTE (WITH BOOT ORDER FIX)
+# PHASE 9: ROUTE (UCI-BASED, BOOT-PERSISTENT)
 # =============================================================================
 v8_setup_route() {
-    v8_log_i "Phase 9: Route setup..."
+    v8_log_i "Phase 9: Route setup via UCI..."
     
-    # 🔑 Если tun0 уже есть — добавляем маршрут сразу
+    # 🔑 Добавляем маршрут через UCI network, а не напрямую
+    # Это гарантирует сохранение после перезагрузки
+    if ! uci show network 2>/dev/null | grep -q "vpn_route_default"; then
+        uci set network.vpn_route_default=route >/dev/null 2>&1
+        uci set network.vpn_route_default.name='vpn-default' >/dev/null 2>&1
+        uci set network.vpn_route_default.interface='tun0' >/dev/null 2>&1
+        uci set network.vpn_route_default.table='vpn' >/dev/null 2>&1
+        uci set network.vpn_route_default.target='0.0.0.0/0' >/dev/null 2>&1
+        uci commit network >/dev/null 2>&1
+        v8_log_boot "Added UCI route: default via tun0 table vpn"
+    fi
+    
+    # Если tun0 уже активен — добавляем маршрут сразу (для первого запуска)
     if ip link show tun0 >/dev/null 2>&1; then
         ip route del table vpn default 2>/dev/null || true
         ip route add table vpn default dev tun0 2>/dev/null && v8_log_i "Route: default dev tun0 table vpn"
-        v8_log_boot "Route added: default dev tun0 table vpn"
+        v8_log_boot "Route added immediately: default dev tun0 table vpn"
     else
-        v8_log_w "tun0 not ready yet. Hotplug will add route when interface comes up."
-        v8_log_boot "tun0 not ready, relying on hotplug"
+        v8_log_w "tun0 not ready yet. UCI route will be applied when interface comes up."
+        v8_log_boot "tun0 not ready, relying on UCI route + hotplug"
     fi
 }
 
@@ -427,9 +463,13 @@ v8_diagnose() {
     echo -e "\n=== MARKING RULES ==="
     v8_rc=$(nft list ruleset 2>/dev/null | grep -c "v8_")
     echo "Found: $v8_rc rules"
+    echo -e "\n=== UCI FIREWALL INCLUDE ==="
+    uci show firewall 2>/dev/null | grep "v8-mark-rules" || echo "Not registered"
     echo -e "\n=== IP RULE ==="
     ip rule 2>/dev/null | grep "0x1" || echo "Not found"
-    echo -e "\n=== VPN ROUTE ==="
+    echo -e "\n=== VPN ROUTE (UCI) ==="
+    uci show network 2>/dev/null | grep "vpn_route_default" || echo "Not in UCI"
+    echo -e "\n=== VPN ROUTE (active) ==="
     ip route show table vpn 2>/dev/null || echo "Empty"
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -3
@@ -452,7 +492,7 @@ v8_diagnose() {
 v8_main() {
     v8_log_boot "=== Script start ==="
     echo "============================================================"
-    echo "  Unified Routing v8.7 (Boot Order Fix + Logging)"
+    echo "  Unified Routing v8.8 (Boot-Persistent via UCI)"
     echo "============================================================"
     v8_self_install
     v8_create_sets
@@ -477,25 +517,33 @@ v8_main() {
 # =============================================================================
 # INIT SCRIPT INTERFACE (for /etc/init.d/)
 # =============================================================================
-# Этот блок позволяет скрипту работать как init-скрипт с правильным приоритетом
-if [ "${1:-}" = "boot" ] || [ -x /etc/rc.common ] && /etc/rc.common boot; then
-    # При загрузке системы: ждём готовности сети перед запуском
-    v8_log_boot "Boot mode: waiting for network..."
-    for v8_i in 1 2 3 4 5; do
-        if ip link show lo >/dev/null 2>&1; then break; fi
-        sleep 2
-    done
+start_service() {
     v8_main
-    exit 0
-fi
+}
 
-v8_cmd="${1:-start}"
-case "$v8_cmd" in
-    start) v8_main ;;
-    clean) v8_cleanup; v8_cleanup_dns; v8_log_i "Cleanup done." ;;
-    stop) for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do nft flush set inet fw4 "$v8_s" 2>/dev/null || true; done ;;
-    reload|restart) "$0" stop; sleep 1; "$0" start ;;
+stop_service() {
+    v8_log_boot "Stopping: clearing sets..."
+    for v8_s in vpn_domains vpn_ip vpn_subnets vpn_community; do
+        nft flush set inet fw4 "$v8_s" 2>/dev/null || true
+    done
+}
+
+reload_service() {
+    stop_service
+    sleep 1
+    start_service
+}
+
+# Обработка вызовов как init-скрипта
+case "${1:-}" in
+    start) start_service ;;
+    stop) stop_service ;;
+    reload|restart) reload_service ;;
     diagnose) v8_diagnose ;;
-    *) echo "Usage: $0 {start|clean|stop|reload|restart|diagnose}"; exit 1 ;;
+    clean) v8_cleanup; v8_cleanup_dns; v8_log_i "Cleanup done." ;;
+    *) 
+        # Если вызван не как init-скрипт — выполняем main
+        v8_main
+        ;;
 esac
 exit 0
