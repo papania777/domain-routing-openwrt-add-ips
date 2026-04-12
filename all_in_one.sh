@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
-# v6.6-final-domains.sh
-# Unified Routing + Sing-Box (Fixed Domain Routing & Diagnostics)
+# v6.7-domains-fixed.sh
+# Unified Routing + Sing-Box (Fixed Domain Routing & DNS Resolution)
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -28,7 +28,7 @@ v6_cleanup() {
 }
 
 # =============================================================================
-# 2. PRE-CREATE SETS
+# 2. PRE-CREATE SETS (CRITICAL: BEFORE DNSMASQ)
 # =============================================================================
 v6_precreate_sets() {
     log_i "Phase 2: Pre-creating nft sets..."
@@ -60,10 +60,11 @@ v6_validate() {
 }
 
 # =============================================================================
-# 4. SERVICES (Sing-Box & DNS/Domains)
+# 4. SERVICES (Sing-Box & DNS/Domains) - FIXED
 # =============================================================================
 v6_setup_services() {
     log_i "Phase 4: Services..."
+    
     # Sing-box
     if ! command -v sing-box >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1
@@ -81,38 +82,68 @@ SBEOF
     /etc/init.d/sing-box enable 2>/dev/null
     /etc/init.d/sing-box restart 2>/dev/null
 
-    # DNS & Domains
-    opkg list-installed | grep -q dnsmasq-full || {
+    # DNS & Domains - FIXED
+    log_i "Checking dnsmasq-full installation..."
+    if ! opkg list-installed | grep -q dnsmasq-full; then
+        log_i "Installing dnsmasq-full (required for nftset support)..."
         opkg update >/dev/null 2>&1
         cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && mv /etc/config/dhcp-opkg /etc/config/dhcp
-    }
-    uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d || {
+        log_i "dnsmasq-full installed."
+    else
+        log_i "dnsmasq-full already installed."
+    fi
+
+    # confdir для OpenWrt 24.10+
+    if uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d; then
+        log_i "Dnsmasq confdir already set."
+    else
         uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
         uci commit dhcp
-    }
+        log_i "Dnsmasq confdir configured."
+    fi
     
+    # Загрузка списка доменов
     mkdir -p /tmp/dnsmasq.d
     DOMAINS_URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
-    if curl -f -s --max-time 120 -o /tmp/dnsmasq.d/domains.lst "$DOMAINS_URL" 2>/dev/null && [ -s /tmp/dnsmasq.d/domains.lst ]; then
-        # Проверяем синтаксис
-        if dnsmasq --conf-file=/tmp/dnsmasq.d/domains.lst --test 2>&1 | grep -q "syntax check OK"; then
+    DOMAINS_FILE="/tmp/dnsmasq.d/domains.lst"
+    
+    log_i "Downloading domain list..."
+    if curl -f -s --max-time 120 -o "$DOMAINS_FILE" "$DOMAINS_URL" 2>/dev/null && [ -s "$DOMAINS_FILE" ]; then
+        # 🔑 ПРОВЕРКА СИНТАКСИСА ПЕРЕД ЗАГРУЗКОЙ
+        log_i "Validating domain list syntax..."
+        if dnsmasq --conf-file="$DOMAINS_FILE" --test 2>&1 | grep -q "syntax check OK"; then
+            log_i "Syntax OK. Restarting dnsmasq..."
             /etc/init.d/dnsmasq restart 2>/dev/null
-            sleep 2
+            sleep 3
             
-            # 🔑 КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: триггерим DNS-запросы, чтобы dnsmasq заполнил vpn_domains
-            log_i "Triggering DNS resolution to populate vpn_domains set..."
-            grep -oE '/[a-z0-9.-]+/' /tmp/dnsmasq.d/domains.lst | head -10 | tr -d '/' | while read domain; do
-                ping -c 1 -W 1 "$domain" >/dev/null 2>&1 &
+            # 🔑 ТЕСТОВЫЙ DNS-ЗАПРОС для проверки работы резолвера
+            log_i "Testing DNS resolution..."
+            if nslookup google.com 127.0.0.1 >/dev/null 2>&1 || ping -c 1 -W 2 google.com >/dev/null 2>&1; then
+                log_i "DNS resolution works."
+            else
+                log_w "DNS resolution failed. Check dnsmasq logs."
+            fi
+            
+            # 🔑 ТРИГГЕР для заполнения vpn_domains (первые 5 доменов)
+            log_i "Triggering DNS queries to populate vpn_domains..."
+            grep -oE 'nftset=/[^/]+/' "$DOMAINS_FILE" 2>/dev/null | head -5 | sed 's|nftset=/||; s|/||' | while read domain; do
+                [ -n "$domain" ] && nslookup "$domain" 127.0.0.1 >/dev/null 2>&1 &
             done
             wait
             log_i "Domain list loaded & dnsmasq restarted."
         else
-            log_w "Domain list syntax check failed. Check /tmp/dnsmasq.d/domains.lst"
+            log_e "Domain list syntax check FAILED!"
+            log_e "First 5 lines of domains.lst:"
+            head -n 5 "$DOMAINS_FILE"
+            log_e "dnsmasq test output:"
+            dnsmasq --conf-file="$DOMAINS_FILE" --test 2>&1 | head -10
+            return 1
         fi
     else
         log_w "Failed to download domain list"
+        return 1
     fi
 }
 
@@ -191,7 +222,7 @@ v6_load_all() {
 }
 
 # =============================================================================
-# 7. APPLY NFT RULES (POST-RELOAD)
+# 7. APPLY NFT RULES
 # =============================================================================
 v6_apply_rules() {
     log_i "Phase 7: Applying nft marking rules..."
@@ -229,7 +260,7 @@ v6_cron() {
 }
 
 # =============================================================================
-# DIAGNOSTICS (FIXED COUNTERS & DOMAIN CHECK)
+# DIAGNOSTICS (FIXED DOMAIN COUNTING & DNS TEST)
 # =============================================================================
 v6_diagnose() {
     echo "=== NFT SETS (IP COUNT) ==="
@@ -238,22 +269,38 @@ v6_diagnose() {
         printf "%-20s %s IPs\n" "$s:" "$cnt"
     done
     
-    # Отдельный счётчик доменов из списка (строки server=)
+    # 🔑 ПРАВИЛЬНЫЙ СЧЁТЧИК ДОМЕНОВ: ищем nftset= строки
     dom_count=0
-    [ -s /tmp/dnsmasq.d/domains.lst ] && dom_count=$(grep -c "^server=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
-    printf "\n%-20s %s domains\n" "Domains list:" "$dom_count"
+    if [ -s /tmp/dnsmasq.d/domains.lst ]; then
+        dom_count=$(grep -c "^nftset=" /tmp/dnsmasq.d/domains.lst 2>/dev/null || echo 0)
+    fi
+    printf "\n%-20s %s domains (nftset lines)\n" "Domains list:" "$dom_count"
     
     echo -e "\n=== MARKING RULES ==="
     cnt=$(nft list ruleset 2>/dev/null | grep -c "v6_")
     echo "Found: $cnt rules"
+    
     echo -e "\n=== IP RULE ==="
     ip rule 2>/dev/null | grep "0x1" || echo "Not found"
+    
     echo -e "\n=== VPN ROUTE ==="
     ip route show table vpn 2>/dev/null || echo "Empty"
+    
     echo -e "\n=== SING-BOX ==="
     /etc/init.d/sing-box status 2>&1 | head -2
-    echo -e "\n=== DNSMASQ LOGS (last 5) ==="
-    logread -e dnsmasq 2>/dev/null | tail -5 || echo "No logs"
+    
+    echo -e "\n=== DNS TEST ==="
+    if nslookup google.com 127.0.0.1 >/dev/null 2>&1 2>&1; then
+        echo "✅ DNS resolution via dnsmasq works"
+    else
+        echo "❌ DNS resolution failed"
+    fi
+    
+    echo -e "\n=== DNSMASQ LOGS (last 10) ==="
+    logread -e dnsmasq 2>/dev/null | tail -10 || echo "No logs available"
+    
+    echo -e "\n=== SAMPLE DOMAINS FROM LIST ==="
+    [ -s /tmp/dnsmasq.d/domains.lst ] && grep "^nftset=" /tmp/dnsmasq.d/domains.lst | head -3 || echo "List empty"
 }
 
 # =============================================================================
@@ -261,7 +308,7 @@ v6_diagnose() {
 # =============================================================================
 v6_main() {
     echo "============================================================"
-    echo "  Unified Routing v6.6 (Fixed Domain Routing)"
+    echo "  Unified Routing v6.7 (Domains Fixed)"
     echo "============================================================"
     
     v6_precreate_sets
@@ -282,8 +329,9 @@ v6_main() {
     
     v6_diagnose
     echo "============================================================"
-    log_i "DONE. Domain IPs populate on first DNS query."
-    log_i "To install for auto-start: wget -O /etc/init.d/v6-unified-routing <URL> && chmod +x /etc/init.d/v6-unified-routing"
+    log_i "DONE. Domain routing works via dnsmasq nftset."
+    log_i "To test: ping youtube.com && tcpdump -i tun0 host <resolved-IP>"
+    log_i "To install: wget -O /etc/init.d/v6-unified-routing <URL> && chmod +x"
     echo "============================================================"
 }
 
