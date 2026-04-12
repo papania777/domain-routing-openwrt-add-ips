@@ -1,7 +1,8 @@
 #!/bin/sh
 # =============================================================================
-# v6.3-final.sh
-# Unified Routing + Sing-Box (Direct Rules, Explicit Route, Fixed Diagnostics)
+# v6.4-stable.sh
+# Unified Domain + IP/Subnet/Community Routing + Sing-Box
+# FIXED: Removed broken $0 copy logic. Safe for sh <(wget -O - URL).
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -28,10 +29,10 @@ v6_cleanup() {
 }
 
 # =============================================================================
-# 2. PRE-CREATE SETS
+# 2. PRE-CREATE NFT SETS
 # =============================================================================
 v6_precreate_sets() {
-    log_i "Phase 2: Pre-creating sets..."
+    log_i "Phase 2: Pre-creating nft sets..."
     for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
         nft list set inet fw4 "$s" >/dev/null 2>&1 || \
             nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
@@ -39,14 +40,15 @@ v6_precreate_sets() {
 }
 
 # =============================================================================
-# 3. VALIDATE
+# 3. VALIDATE & REPAIR
 # =============================================================================
 v6_validate() {
-    log_i "Phase 3: Validate..."
+    log_i "Phase 3: Validate system..."
     command -v curl >/dev/null 2>&1 || { log_e "curl missing"; exit 1; }
     command -v nft  >/dev/null 2>&1 || { log_e "nft missing"; exit 1; }
     grep -q "99 vpn" /etc/iproute2/rt_tables 2>/dev/null || {
-        sed -i '/99.*vpn/d' /etc/iproute2/rt_tables 2>/dev/null; echo '99 vpn' >> /etc/iproute2/rt_tables
+        sed -i '/99.*vpn/d' /etc/iproute2/rt_tables 2>/dev/null
+        echo '99 vpn' >> /etc/iproute2/rt_tables
     }
     uci show network 2>/dev/null | grep -q "mark='0x1'" || {
         uci add network rule >/dev/null 2>&1
@@ -63,40 +65,74 @@ v6_validate() {
 # =============================================================================
 v6_setup_services() {
     log_i "Phase 4: Services..."
-    # Sing-box
-    command -v sing-box >/dev/null 2>&1 || { opkg update >/dev/null 2>&1; opkg install sing-box >/dev/null 2>&1 || exit 1; }
-    [ ! -f /etc/sing-box/config.json ] && {
+    if ! command -v sing-box >/dev/null 2>&1; then
+        opkg update >/dev/null 2>&1
+        opkg install sing-box >/dev/null 2>&1 || { log_e "sing-box install failed"; exit 1; }
+    fi
+    if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
         cat > /etc/sing-box/config.json << 'SBEOF'
-{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"socks","tag":"proxy","server":"127.0.0.1","server_port":1080}],"route":{"auto_detect_interface":true}}
-SBEOF
-        log_i "Sing-box config created. EDIT IT!"
+{
+  "log": { "level": "debug" },
+  "inbounds": [
+    {
+      "type": "tun",
+      "interface_name": "tun0",
+      "domain_strategy": "ipv4_only",
+      "address": ["172.16.250.1/30"],
+      "auto_route": false,
+      "strict_route": false,
+      "sniff": true
     }
-    /etc/init.d/sing-box enable 2>/dev/null; /etc/init.d/sing-box restart 2>/dev/null
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "proxy",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    }
+  ],
+  "route": { "auto_detect_interface": true }
+}
+SBEOF
+        log_i "Sing-box config created. EDIT /etc/sing-box/config.json TO SET YOUR PROXY!"
+    else
+        log_i "Sing-box config exists (preserved)."
+    fi
+    /etc/init.d/sing-box enable 2>/dev/null
+    /etc/init.d/sing-box restart 2>/dev/null
 
     # DNS
     opkg list-installed | grep -q dnsmasq-full || {
-        opkg update >/dev/null 2>&1; cd /tmp && opkg download dnsmasq-full 2>/dev/null
+        opkg update >/dev/null 2>&1
+        cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && mv /etc/config/dhcp-opkg /etc/config/dhcp
     }
     uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d || {
-        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'; uci commit dhcp
+        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
+        uci commit dhcp
     }
     mkdir -p /tmp/dnsmasq.d
     DOMAINS_URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
-    curl -f -s --max-time 120 -o /tmp/dnsmasq.d/domains.lst "$DOMAINS_URL" 2>/dev/null && [ -s /tmp/dnsmasq.d/domains.lst ] && {
-        dnsmasq --conf-file=/tmp/dnsmasq.d/domains.lst --test 2>&1 | grep -q "syntax check OK" && {
-            /etc/init.d/dnsmasq restart 2>/dev/null; log_i "Domains loaded."
-        } || log_w "Domain list syntax failed"
-    } || log_w "Domain list download failed"
+    if curl -f -s --max-time 120 -o /tmp/dnsmasq.d/domains.lst "$DOMAINS_URL" 2>/dev/null && [ -s /tmp/dnsmasq.d/domains.lst ]; then
+        if dnsmasq --conf-file=/tmp/dnsmasq.d/domains.lst --test 2>&1 | grep -q "syntax check OK"; then
+            /etc/init.d/dnsmasq restart 2>/dev/null
+            log_i "Domain list loaded & dnsmasq restarted."
+        else
+            log_w "Domain list syntax check failed"
+        fi
+    else
+        log_w "Failed to download domain list"
+    fi
 }
 
 # =============================================================================
 # 5. FIREWALL & HOTPLUG
 # =============================================================================
 v6_setup_fw() {
-    log_i "Phase 5: Firewall..."
+    log_i "Phase 5: Firewall & Hotplug..."
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/30-vpnroute << 'HEOF'
 #!/bin/sh
@@ -134,23 +170,26 @@ v6_load_list() {
     ln="$1"; ls="$2"; lb="${3:-https://antifilter.download}"
     lu="${lb}/list/${ln}.lst"; lt="/tmp/lst/${ls}.lst"
     mkdir -p /tmp/lst
-    curl -f -s --max-time 120 -o "$lt" "$lu" 2>/dev/null || return 1
-    [ -s "$lt" ] || return 1
+    curl -f -s --max-time 120 -o "$lt" "$lu" 2>/dev/null || { log_w "Download failed: $ln"; return 1; }
+    [ -s "$lt" ] || { log_w "Empty: $ln"; return 1; }
     nft flush set inet fw4 "$ls" 2>/dev/null || true
     sed 's/\r//g' "$lt" | grep -oE '[0-9.]+(/[0-9]{1,2})?' | sort -u > /tmp/lst/${ls}.valid 2>/dev/null || true
-    [ -s /tmp/lst/${ls}.valid ] || return 1
+    [ -s /tmp/lst/${ls}.valid ] || { rm -f "$lt"; return 1; }
     cnt=0; b=""; done=0
     while IFS= read -r l; do
         [ -z "$l" ] && continue
         [ -z "$b" ] && b="$l" || b="${b}, ${l}"
         cnt=$((cnt+1))
-        if [ $cnt -ge 500 ]; then
+        if [ "$cnt" -ge 500 ]; then
             printf 'add element inet fw4 %s { %s }\n' "$ls" "$b" > /tmp/lst/batch.nft
             nft -f /tmp/lst/batch.nft 2>/dev/null && done=$((done+cnt))
             b=""; cnt=0
         fi
     done < /tmp/lst/${ls}.valid
-    [ -n "$b" ] && printf 'add element inet fw4 %s { %s }\n' "$ls" "$b" > /tmp/lst/batch.nft && nft -f /tmp/lst/batch.nft 2>/dev/null && done=$((done+cnt))
+    if [ -n "$b" ]; then
+        printf 'add element inet fw4 %s { %s }\n' "$ls" "$b" > /tmp/lst/batch.nft
+        nft -f /tmp/lst/batch.nft 2>/dev/null && done=$((done+cnt))
+    fi
     rm -f "$lt" /tmp/lst/${ls}.valid /tmp/lst/batch.nft
     log_i "Loaded ~$done into $ls."
 }
@@ -164,7 +203,7 @@ v6_load_all() {
 }
 
 # =============================================================================
-# 7. DIRECT MARKING RULES (NO HELPER SCRIPT ISSUES)
+# 7. DIRECT MARKING RULES
 # =============================================================================
 v6_apply_rules() {
     log_i "Phase 7: Applying direct nft marking rules..."
@@ -195,15 +234,16 @@ v6_setup_route() {
 }
 
 v6_cron() {
+    log_i "Phase 9: Configuring cron..."
     cmd="0 */12 * * * /etc/init.d/v6-unified-routing start"
     cur=$(crontab -l 2>/dev/null) || cur=""
     echo "$cur" | grep -q "v6-unified-routing" 2>/dev/null && return 0
-    { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || true
+    { echo "$cur"; echo "$cmd"; } | crontab - 2>/dev/null || log_w "Failed to update crontab"
     /etc/init.d/cron restart >/dev/null 2>&1 || true
 }
 
 # =============================================================================
-# DIAGNOSTICS (FIXED COUNTER)
+# DIAGNOSTICS
 # =============================================================================
 v6_diagnose() {
     echo "=== NFT SETS (REAL IP COUNT) ==="
@@ -228,7 +268,7 @@ v6_diagnose() {
 # =============================================================================
 v6_main() {
     echo "============================================================"
-    echo "  Unified Routing v6.3-Final (Direct Rules + Explicit Route)"
+    echo "  Unified Routing v6.4-Stable (Direct Execution)"
     echo "============================================================"
     v6_precreate_sets
     v6_cleanup
@@ -236,26 +276,24 @@ v6_main() {
     v6_setup_services
     v6_setup_fw
     v6_load_all
-    v6_apply_rules    # <-- Прямое применение правил
-    v6_setup_route    # <-- Явное добавление маршрута
+    v6_apply_rules
+    v6_setup_route
     v6_cron
     /etc/init.d/firewall reload >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
     v6_diagnose
     echo "============================================================"
-    log_i "DONE. Script saved to /etc/init.d/v6-unified-routing"
-    echo "Re-run: /etc/init.d/v6-unified-routing {start|diagnose|clean}"
+    log_i "DONE."
+    echo "To install for auto-start & cron, run:"
+    echo "  wget -O /etc/init.d/v6-unified-routing <SCRIPT_URL>"
+    echo "  chmod +x /etc/init.d/v6-unified-routing"
+    echo "  /etc/init.d/v6-unified-routing start"
     echo "============================================================"
 }
 
-# Auto-install if run from stream
-case "$0" in /dev/fd/*|/tmp/*|/proc/*|"")
-    log_i "Stream execution detected. Installing..."
-    mkdir -p /etc/init.d
-    cp "$0" /etc/init.d/v6-unified-routing 2>/dev/null && chmod +x /etc/init.d/v6-unified-routing && exec /etc/init.d/v6-unified-routing start
-    ;;
-esac
-
+# =============================================================================
+# DISPATCHER (NO $0 COPY, SAFE FOR SH <(WGET...))
+# =============================================================================
 cmd="${1:-start}"
 case "$cmd" in
     start) v6_main ;;
