@@ -1,12 +1,11 @@
 #!/bin/sh
 # =============================================================================
-# v8.3-cron-fixed.sh
-# Unified Routing: Domain + IP/Subnet/Community + Sing-Box
-# ИСПРАВЛЕНО: Гарантированное добавление cron, совместимость ash, авто-установка
+# v8.4-extended-tun.sh
+# Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
+# ИСПРАВЛЕНО: Интеграция sing-box-extended, ожидание tun0, валидация конфига
 # =============================================================================
 
-# 🔧 ВНИМАНИЕ: Замените URL на прямую ссылку к вашему raw-файлу на GitHub!
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/add_IPs.sh"
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
 v8_log_i() { printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
@@ -14,32 +13,38 @@ v8_log_w() { printf "${v8_yellow}[WARN]${v8_nc} %s\n" "$1"; }
 v8_log_e() { printf "${v8_red}[ERROR]${v8_nc} %s\n" "$1"; }
 
 # =============================================================================
-# PHASE 0: SELF-INSTALL
+# PHASE 0: SELF-INSTALL & CRON
 # =============================================================================
 v8_self_install() {
-    v8_log_i "Phase 0: Self-installing to /etc/init.d/..."
+    v8_log_i "Phase 0: Self-installing & configuring cron..."
     v8_init_path="/etc/init.d/v8-unified-routing"
     v8_tmp_path="/tmp/v8-install-check.sh"
 
     if [ -x "$v8_init_path" ]; then
         v8_log_i "Script already installed."
-        return 0
+    else
+        if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
+            sed -i 's/\r$//' "$v8_tmp_path"
+            if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
+                cp "$v8_tmp_path" "$v8_init_path"
+                chmod +x "$v8_init_path"
+                rm -f "$v8_tmp_path"
+                "$v8_init_path" enable 2>/dev/null || true
+                v8_log_i "✅ Installed & enabled."
+            else
+                v8_log_w "Invalid download. Skipping auto-install."
+                rm -f "$v8_tmp_path"
+            fi
+        else
+            v8_log_w "Download failed. Manual install required."
+        fi
     fi
 
-    if wget -q -O "$v8_tmp_path" "$V8_SCRIPT_URL" 2>/dev/null; then
-        sed -i 's/\r$//' "$v8_tmp_path"
-        if head -n 1 "$v8_tmp_path" | grep -q '#!/bin/sh'; then
-            cp "$v8_tmp_path" "$v8_init_path"
-            chmod +x "$v8_init_path"
-            rm -f "$v8_tmp_path"
-            "$v8_init_path" enable 2>/dev/null || true
-            v8_log_i "✅ Installed & enabled successfully."
-        else
-            v8_log_w "Downloaded file invalid. Skipping auto-install."
-            rm -f "$v8_tmp_path"
-        fi
-    else
-        v8_log_w "Failed to download script. Manual install required later."
+    /etc/init.d/cron enable 2>/dev/null || true
+    if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
+        (crontab -l 2>/dev/null; echo "0 */12 * * * $v8_init_path start") | crontab - 2>/dev/null
+        /etc/init.d/cron restart 2>/dev/null || true
+        v8_log_i "✅ Cron job added (every 12h)"
     fi
 }
 
@@ -49,14 +54,13 @@ v8_self_install() {
 v8_cleanup() {
     v8_log_i "Phase 1: General cleanup..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
-    # Очищаем cron от старых записей перед настройкой
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v8-unified" | crontab - 2>/dev/null || true
     for v8_r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
         uci delete firewall."$v8_r" >/dev/null 2>&1
     done
     uci commit firewall >/dev/null 2>&1
     rm -f /usr/sbin/v8-mark-rules.sh
-    rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft
+    rm -rf /tmp/lst/* /tmp/dnsmasq.d/* /tmp/v8_batch.nft /tmp/sing-box-*
     v8_log_i "General cleanup done."
 }
 
@@ -186,18 +190,91 @@ EOF
 }
 
 # =============================================================================
-# PHASE 6: SING-BOX SERVICE
+# PHASE 6: SING-BOX & EXTENDED INSTALL (INTEGRATED + FIXED)
 # =============================================================================
+v8_install_extended() {
+    v8_log_i "Installing/Updating sing-box-extended..."
+    v8_host_arch=$(uname -m)
+    if [ -f "/etc/openwrt_release" ]; then
+        v8_dist_arch=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH")
+        case "$v8_dist_arch" in *mipsel*|*mipsle*) v8_host_arch="mipsel" ;; *mips64el*|*mips64le*) v8_host_arch="mips64el" ;; esac
+    fi
+    case $v8_host_arch in
+        aarch64) v8_arch="arm64" ;; armv7*) v8_arch="armv7" ;; armv6*) v8_arch="armv6" ;;
+        x86_64) v8_arch="amd64" ;; i386|i686) v8_arch="386" ;; mips) v8_arch="mips-softfloat" ;;
+        mipsel|mipsle) v8_arch="mipsle-softfloat" ;; mips64) v8_arch="mips64" ;;
+        mips64el|mips64le) v8_arch="mips64le" ;; riscv64) v8_arch="riscv64" ;; *) v8_log_e "Unsupported arch"; return 1 ;;
+    esac
+
+    v8_api="https://api.github.com/repos/shtorm-7/sing-box-extended/releases/latest"
+    v8_res=$(curl -fsSL --insecure "$v8_api" 2>/dev/null || wget -qO- --no-check-certificate "$v8_api" 2>/dev/null)
+    [ -z "$v8_res" ] && { v8_log_w "GitHub API unreachable. Using existing binary."; return 0; }
+
+    v8_url=$(echo "$v8_res" | grep "browser_download_url" | grep "linux-$v8_arch.tar.gz" | head -1 | awk -F '"' '{print $4}')
+    [ -z "$v8_url" ] && { v8_log_w "No binary for $v8_arch. Keeping current."; return 0; }
+
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+    cd /tmp
+    curl -fsSL --insecure -o sing-box-ext.tar.gz "$v8_url" 2>/dev/null || wget -q --no-check-certificate -O sing-box-ext.tar.gz "$v8_url" 2>/dev/null
+    [ -s sing-box-ext.tar.gz ] || { v8_log_w "Download failed"; return 0; }
+
+    tar -xzf sing-box-ext.tar.gz 2>/dev/null
+    v8_bin=$(find . -type f -name sing-box | head -n 1)
+    if [ -n "$v8_bin" ]; then
+        /etc/init.d/sing-box stop 2>/dev/null || service sing-box stop 2>/dev/null || true
+        sleep 2
+        cp -f "$v8_bin" /usr/bin/sing-box
+        chmod +x /usr/bin/sing-box
+        v8_log_i "✅ sing-box-extended binary replaced."
+    fi
+    rm -f sing-box-ext.tar.gz && rm -rf ./sing-box*
+    cd /
+}
+
 v8_setup_singbox() {
-    v8_log_i "Phase 6: Sing-Box..."
-    command -v sing-box >/dev/null 2>&1 || { opkg update >/dev/null 2>&1; opkg install sing-box >/dev/null 2>&1 || exit 1; }
+    v8_log_i "Phase 6: Sing-Box setup & validation..."
+    # 1. Base package (for init scripts)
+    if ! opkg list-installed | grep -q sing-box; then
+        opkg update >/dev/null 2>&1
+        opkg install sing-box >/dev/null 2>&1 || { v8_log_e "sing-box package failed"; exit 1; }
+    fi
+
+    # 2. Install Extended version
+    v8_install_extended
+
+    # 3. Config handling (NEVER overwrite existing working config)
     if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
-        printf '{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true}}\n' > /etc/sing-box/config.json
-        v8_log_i "Sing-box config created. EDIT outbounds TO SET YOUR PROXY!"
+        cat > /etc/sing-box/config.json << 'SBEOF'
+{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"auto_detect_interface":true}}
+SBEOF
+        v8_log_i "Default config created. EDIT outbounds TO SET YOUR PROXY!"
+    else
+        v8_log_i "Existing config preserved."
     fi
+
+    # 4. Validate config before start
+    if sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
+        v8_log_i "Config syntax OK."
+    else
+        v8_log_w "Config syntax check failed. Sing-box may not start."
+    fi
+
+    # 5. Start service
     /etc/init.d/sing-box enable 2>/dev/null
-    /etc/init.d/sing-box restart 2>/dev/null
+    /etc/init.d/sing-box restart 2>/dev/null || service sing-box restart 2>/dev/null
+
+    # 6. Wait for tun0 (up to 10 seconds)
+    v8_tun_wait=0
+    while [ $v8_tun_wait -lt 10 ]; do
+        if ip link show tun0 >/dev/null 2>&1; then
+            v8_log_i "✅ Sing-Box running. tun0 interface created."
+            return 0
+        fi
+        sleep 1
+        v8_tun_wait=$((v8_tun_wait + 1))
+    done
+    v8_log_w "tun0 not created after 10s. Check logs: logread | grep sing-box"
 }
 
 # =============================================================================
@@ -270,7 +347,7 @@ HELPER
 }
 
 # =============================================================================
-# PHASE 9: ROUTE & CRON (ИСПРАВЛЕНО)
+# PHASE 9: ROUTE
 # =============================================================================
 v8_setup_route() {
     v8_log_i "Phase 9: Route setup..."
@@ -278,28 +355,7 @@ v8_setup_route() {
         ip route del table vpn default 2>/dev/null
         ip route add table vpn default dev tun0 2>/dev/null && v8_log_i "Route: default dev tun0 table vpn"
     else
-        v8_log_w "tun0 not up yet. Hotplug will add route later."
-    fi
-}
-
-v8_setup_cron() {
-    v8_log_i "Phase 10: Configuring auto-update cron..."
-    # 1. Гарантируем включение сервиса cron
-    /etc/init.d/cron enable 2>/dev/null || true
-    
-    # 2. Проверяем наличие задачи
-    if crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
-        v8_log_i "✅ Cron job already configured."
-        return 0
-    fi
-
-    # 3. Безопасное добавление (стандартный паттерн OpenWrt)
-    (crontab -l 2>/dev/null; echo "0 */12 * * * /etc/init.d/v8-unified-routing start") | crontab - 2>/dev/null
-    if [ $? -eq 0 ]; then
-        /etc/init.d/cron restart 2>/dev/null || true
-        v8_log_i "✅ Cron job added (updates every 12h)"
-    else
-        v8_log_w "Failed to update crontab. Add manually: 0 */12 * * * /etc/init.d/v8-unified-routing start"
+        v8_log_w "tun0 still missing. Route skipped. Check sing-box logs."
     fi
 }
 
@@ -322,10 +378,10 @@ v8_diagnose() {
     ip rule 2>/dev/null | grep "0x1" || echo "Not found"
     echo -e "\n=== VPN ROUTE ==="
     ip route show table vpn 2>/dev/null || echo "Empty"
+    echo -e "\n=== SING-BOX ==="
+    /etc/init.d/sing-box status 2>&1 | head -3
     echo -e "\n=== DNS TEST ==="
     if nslookup google.com 127.0.0.1 >/dev/null 2>&1; then echo "✅ Works"; else echo "❌ Failed"; fi
-    echo -e "\n=== SING-BOX ==="
-    /etc/init.d/sing-box status 2>&1 | head -2
     echo -e "\n=== CRON & INIT ==="
     crontab -l 2>/dev/null | grep "v8-unified" || echo "❌ Not in cron"
     [ -x /etc/init.d/v8-unified-routing ] && echo "✅ Installed in init.d" || echo "❌ Not installed"
@@ -336,7 +392,7 @@ v8_diagnose() {
 # =============================================================================
 v8_main() {
     echo "============================================================"
-    echo "  Unified Routing v8.3 (Fixed Cron + Auto-Install)"
+    echo "  Unified Routing v8.4 (Extended SB + tun0 Fix + Cron)"
     echo "============================================================"
     v8_self_install
     v8_create_sets
@@ -345,21 +401,17 @@ v8_main() {
     v8_cleanup_dns
     v8_setup_domains
     v8_setup_fw
-    v8_setup_singbox
+    v8_setup_singbox   # <-- Теперь устанавливает extended, проверяет конфиг и ждёт tun0
     v8_load_all
     v8_apply_rules
     v8_setup_route
-    v8_setup_cron    # <-- Отдельная фаза, вызывается в конце
     v8_diagnose
     echo "============================================================"
-    v8_log_i "DONE. Script auto-installed. Cron & Routing active."
-    echo "Manage service: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
+    v8_log_i "DONE. All components active. Routing ready."
+    echo "Manage: /etc/init.d/v8-unified-routing {start|stop|restart|diagnose}"
     echo "============================================================"
 }
 
-# =============================================================================
-# DISPATCHER
-# =============================================================================
 v8_cmd="${1:-start}"
 case "$v8_cmd" in
     start) v8_main ;;
