@@ -1,9 +1,12 @@
 #!/bin/sh
 # =============================================================================
-# v6.0-omnibus-singbox.sh
-# Unified Routing & Sing-Box Installer (Self-Healing, Stream-Safe)
-# Автоматически настраивает Sing-Box, маршрутизацию, firewall и списки.
-# Сохраняет конфиг Sing-Box, чистит старые версии, совместим с ash.
+# v6.0-unified-singbox.sh
+# Unified Domain + IP/Subnet/Community Routing + Sing-Box Installer
+# Заменяет getdomains-install.sh + add-ip-subnet-routing
+# Источники:
+#   - Домены: https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst
+#   - IP/Subnet/Community: https://antifilter.download, https://community.antifilter.download
+# Совместимость: OpenWrt 23.05/24.10, ash (stream), fw4/nft, 256MB RAM
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -31,7 +34,7 @@ v6_cleanup() {
         log_i "Cleared old cron entries."
     fi
 
-    # 3. Удаление старых UCI-правил (ipset, set, include)
+    # 3. Удаление старых UCI-правил
     uci_rules=$(uci show firewall 2>/dev/null | grep -E "\.(ipset|set)='vpn_|path.*apply-vpn-mark-rules")
     if [ -n "$uci_rules" ]; then
         for r in $(echo "$uci_rules" | cut -d= -f1 | cut -d. -f2); do
@@ -41,18 +44,18 @@ v6_cleanup() {
         log_i "Cleared legacy UCI firewall rules."
     fi
 
-    # 4. Удаление старых скриптов и сервисов
-    rm -f /usr/sbin/apply-vpn-mark-rules.sh /etc/init.d/add-ip-subnet-routing
-    rm -f /etc/init.d/getdomains /etc/hotplug.d/iface/30-vpnroute /etc/hotplug.d/net/30-vpnroute
+    # 4. Удаление старых скриптов
+    rm -f /usr/sbin/apply-vpn-mark-rules.sh /etc/init.d/add-ip-subnet-routing /etc/init.d/getdomains
+    rm -f /etc/hotplug.d/iface/30-vpnroute /etc/hotplug.d/net/30-vpnroute
     log_i "Removed old scripts & hotplug rules."
 
-    # 5. Очистка nft sets (только наших)
+    # 5. Очистка nft sets
     for s in vpn_ip vpn_subnets vpn_community vpn_domains; do
         nft flush set inet fw4 "$s" 2>/dev/null || true
     done
     
     # 6. Очистка временных файлов
-    rm -rf /tmp/lst/* /tmp/batch.nft /tmp/routing-v*.sh /tmp/add*.sh
+    rm -rf /tmp/lst/* /tmp/batch.nft /tmp/dnsmasq.d/domains.lst
     log_i "Flushed nft sets & cleared temp files."
 }
 
@@ -85,7 +88,7 @@ v6_validate() {
 }
 
 # =============================================================================
-# PHASE 3: SING-BOX SETUP (Fixed & Safe)
+# PHASE 3: SING-BOX SETUP (Safe, with backup)
 # =============================================================================
 v6_setup_singbox() {
     log_i "Phase 3: Setting up Sing-Box..."
@@ -99,7 +102,7 @@ v6_setup_singbox() {
         log_i "Sing-box already installed."
     fi
 
-    # Конфигурация
+    # Конфигурация (только если файла нет)
     if [ ! -f /etc/sing-box/config.json ]; then
         log_i "Creating default sing-box config..."
         mkdir -p /etc/sing-box
@@ -128,7 +131,7 @@ v6_setup_singbox() {
 SBEOF
         log_i "Config created. Edit /etc/sing-box/config.json manually!"
     else
-        log_i "Sing-box config exists (preserved from backup or previous setup)."
+        log_i "Sing-box config exists (preserved from backup)."
     fi
 
     # Включение сервиса
@@ -138,7 +141,7 @@ SBEOF
 }
 
 # =============================================================================
-# PHASE 4: FIREWALL & NETWORK (Hotplug, Zones, Sets)
+# PHASE 4: FIREWALL & NETWORK (Sing-Box only)
 # =============================================================================
 v6_setup_firewall() {
     log_i "Phase 4: Configuring Firewall & Network..."
@@ -148,6 +151,7 @@ v6_setup_firewall() {
     cat > /etc/hotplug.d/iface/30-vpnroute << 'HEOF'
 #!/bin/sh
 if [ "$ACTION" = "ifup" ] && [ "$INTERFACE" = "tun0" ]; then
+    sleep 10
     ip route add table vpn default dev tun0
 fi
 HEOF
@@ -155,7 +159,7 @@ HEOF
     cp /etc/hotplug.d/iface/30-vpnroute /etc/hotplug.d/net/30-vpnroute 2>/dev/null || true
     log_i "Hotplug rule for tun0 created."
 
-    # 2. Создание зон и Forwarding
+    # 2. Создание зоны singbox
     if ! uci show firewall | grep -q "@zone.*name='singbox'"; then
         uci add firewall zone
         uci set firewall.@zone[-1].name='singbox'
@@ -165,20 +169,23 @@ HEOF
         uci set firewall.@zone[-1].input='ACCEPT'
         uci set firewall.@zone[-1].masq='1'
         uci set firewall.@zone[-1].mtu_fix='1'
+        uci set firewall.@zone[-1].family='ipv4'
         uci commit firewall
         log_i "Firewall zone 'singbox' created."
     fi
 
+    # 3. Forwarding lan -> singbox
     if ! uci show firewall | grep -q "@forwarding.*name='singbox-lan'"; then
         uci add firewall forwarding
         uci set firewall.@forwarding[-1].name='singbox-lan'
         uci set firewall.@forwarding[-1].dest='singbox'
         uci set firewall.@forwarding[-1].src='lan'
+        uci set firewall.@forwarding[-1].family='ipv4'
         uci commit firewall
         log_i "Forwarding lan -> singbox created."
     fi
 
-    # 3. Создание nft sets (для IP/Subnet/Community)
+    # 4. Создание nft sets
     for s in vpn_ip vpn_subnets vpn_community; do
         if ! nft list set inet fw4 "$s" >/dev/null 2>&1; then
             nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
@@ -188,10 +195,11 @@ HEOF
 }
 
 # =============================================================================
-# PHASE 5: DNS & DNsmasq
+# PHASE 5: DNS & DNsmasq (Domain routing)
 # =============================================================================
 v6_setup_dns() {
     log_i "Phase 5: Configuring DNS & Dnsmasq..."
+    
     # Установка dnsmasq-full
     if ! opkg list-installed | grep -q dnsmasq-full; then
         opkg update >/dev/null 2>&1
@@ -201,7 +209,7 @@ v6_setup_dns() {
         log_i "dnsmasq-full installed."
     fi
 
-    # Настройка confdir (для OpenWrt 24.10+)
+    # Настройка confdir
     if uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d; then
         log_i "Dnsmasq confdir already set."
     else
@@ -213,9 +221,39 @@ v6_setup_dns() {
 }
 
 # =============================================================================
-# PHASE 6: DOWNLOAD & LOAD LISTS (Robust)
+# PHASE 6: DOMAIN LIST DOWNLOAD (from original script logic)
 # =============================================================================
-v6_download() {
+v6_load_domains() {
+    log_i "Phase 6: Loading domain list..."
+    DOMAINS_URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
+    DOMAINS_TMP="/tmp/dnsmasq.d/domains.lst"
+    mkdir -p /tmp/dnsmasq.d
+
+    log_i "Downloading domains list..."
+    if ! curl -f -s --max-time 120 -o "$DOMAINS_TMP" "$DOMAINS_URL" 2>/dev/null; then
+        log_w "Domain list download failed"
+        return 1
+    fi
+    if [ ! -s "$DOMAINS_TMP" ]; then
+        log_w "Domain list file empty"
+        return 1
+    fi
+
+    # Проверка синтаксиса dnsmasq
+    if dnsmasq --conf-file="$DOMAINS_TMP" --test 2>&1 | grep -q "syntax check OK"; then
+        /etc/init.d/dnsmasq restart 2>/dev/null || true
+        log_i "Domain list loaded and dnsmasq restarted."
+    else
+        log_w "Domain list syntax check failed"
+        return 1
+    fi
+    return 0
+}
+
+# =============================================================================
+# PHASE 7: IP/SUBNET/COMMUNITY DOWNLOAD & LOAD
+# =============================================================================
+v6_download_list() {
     dl_name="$1"; dl_set="$2"; dl_base="${3:-https://antifilter.download}"
     dl_url="${dl_base}/list/${dl_name}.lst"
     dl_tmp="/tmp/lst/${dl_set}.lst"
@@ -273,13 +311,13 @@ v6_load_batch() {
     return 0
 }
 
-v6_load_all() {
-    log_i "Phase 6: Parallel download & sequential load..."
-    v6_download "ip" "vpn_ip" "https://antifilter.download" &
+v6_load_all_lists() {
+    log_i "Phase 7: Parallel download & sequential load (IP/Subnet/Community)..."
+    v6_download_list "ip" "vpn_ip" "https://antifilter.download" &
     pid_ip=$!
-    v6_download "subnet" "vpn_subnets" "https://antifilter.download" &
+    v6_download_list "subnet" "vpn_subnets" "https://antifilter.download" &
     pid_sub=$!
-    v6_download "community" "vpn_community" "https://community.antifilter.download" &
+    v6_download_list "community" "vpn_community" "https://community.antifilter.download" &
     pid_comm=$!
 
     wait $pid_ip 2>/dev/null || log_w "list_ip download failed"
@@ -289,21 +327,16 @@ v6_load_all() {
     v6_load_batch "vpn_ip"
     v6_load_batch "vpn_subnets"
     v6_load_batch "vpn_community"
-    
-    # Загрузка доменов через сервис getdomains (если установлен основной скрипт)
-    if [ -x /etc/init.d/getdomains ]; then
-        /etc/init.d/getdomains start 2>/dev/null || log_w "getdomains failed"
-    else
-        log_w "getdomains service not found. Domains routing will work only if configured separately."
-    fi
 }
 
 # =============================================================================
-# PHASE 7: RULES, PERSISTENCE & CRON
+# PHASE 8: MARKING RULES & PERSISTENCE
 # =============================================================================
 v6_apply_rules() {
-    log_i "Phase 7: Applying rules & persistence..."
+    log_i "Phase 8: Applying marking rules & persistence..."
     h_path="/usr/sbin/apply-vpn-mark-rules.sh"
+    
+    # Создаём helper с проверкой на дубликаты
     printf '%s\n' '#!/bin/sh' \
         '[ -z "$(nft list table inet fw4 2>/dev/null)" ] && exit 0' \
         'for v6c in prerouting output; do' \
@@ -314,6 +347,7 @@ v6_apply_rules() {
         'done' > "$h_path"
     chmod +x "$h_path"
 
+    # Регистрируем в UCI
     if ! uci show firewall 2>/dev/null | grep -q "apply-vpn-mark-rules"; then
         uci add firewall include >/dev/null 2>&1
         uci set firewall.@include[-1].type='script'
@@ -321,15 +355,19 @@ v6_apply_rules() {
         uci set firewall.@include[-1].reload='1'
         uci commit firewall >/dev/null 2>&1
     fi
+    
     "$h_path"
-    log_i "Marking rules active."
+    log_i "Marking rules active & persistence registered."
 }
 
+# =============================================================================
+# PHASE 9: CRON & FINALIZATION
+# =============================================================================
 v6_cron() {
-    log_i "Phase 8: Configuring cron..."
-    cr_cmd="0 */12 * * * /etc/init.d/add-ip-subnet-routing start"
+    log_i "Phase 9: Configuring cron..."
+    cr_cmd="0 */12 * * * /etc/init.d/v6-unified-routing start"
     cr_cur=$(crontab -l 2>/dev/null) || cr_cur=""
-    echo "$cr_cur" | grep -q "add-ip-subnet-routing" 2>/dev/null && return 0
+    echo "$cr_cur" | grep -q "v6-unified-routing" 2>/dev/null && return 0
     { echo "$cr_cur"; echo "$cr_cmd"; } | crontab - 2>/dev/null || log_w "Failed to update crontab"
     /etc/init.d/cron restart >/dev/null 2>&1 || true
 }
@@ -339,15 +377,17 @@ v6_cron() {
 # =============================================================================
 v6_main() {
     echo "============================================================"
-    echo "  Routing & Sing-Box Installer v6.0 (Unified)"
-    echo "  Auto-backup, Self-Healing, Stream-Safe"
+    echo "  Unified Routing v6.0 (Domains + IP/Subnet/Community)"
+    echo "  Sing-Box focused, Self-Healing, Stream-Safe"
     echo "============================================================"
+    
     v6_cleanup
     v6_validate
     v6_setup_singbox
     v6_setup_firewall
     v6_setup_dns
-    v6_load_all
+    v6_load_domains          # Домены из оригинального скрипта
+    v6_load_all_lists        # IP/Subnet/Community из моего скрипта
     v6_apply_rules
     v6_cron
     
@@ -357,17 +397,23 @@ v6_main() {
     
     echo "============================================================"
     log_i "DONE. System is clean, Sing-Box active, routing ready."
-    echo "Verify: nft list sets | grep vpn_"
+    echo "Verify:"
+    echo "  • Domains:  nft list set inet fw4 vpn_domains | head"
+    echo "  • IP lists: nft list sets | grep vpn_"
+    echo "  • Rules:    nft list ruleset | grep 'v6_'"
     echo "============================================================"
 }
 
+# =============================================================================
+# DISPATCHER (Stream-Safe)
+# =============================================================================
 v6_cmd="${1:-start}"
 if [ "$v6_cmd" = "start" ]; then
     v6_main
 elif [ "$v6_cmd" = "clean" ]; then
     v6_cleanup; log_i "Cleanup done."
 elif [ "$v6_cmd" = "stop" ]; then
-    log_i "Clearing sets..."; for cs in vpn_ip vpn_subnets vpn_community; do nft flush set inet fw4 "$cs" 2>/dev/null || true; done
+    log_i "Clearing sets..."; for cs in vpn_ip vpn_subnets vpn_community vpn_domains; do nft flush set inet fw4 "$cs" 2>/dev/null || true; done
 elif [ "$v6_cmd" = "reload" ] || [ "$v6_cmd" = "restart" ]; then
     "$0" stop; sleep 1; "$0" start
 else
