@@ -1,4 +1,4 @@
-#!/bin/sh /etc/rc.common
+!/bin/sh /etc/rc.common
 # =============================================================================
 # v8.10-init-stable.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
@@ -9,7 +9,7 @@ START=99
 STOP=95
 
 # 🔧 ВНИМАНИЕ: Замените URL на прямую ссылку к вашему raw-файлу на GitHub!
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/add_IPs.sh"
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
 
 v8_green='\033[32;1m'; v8_red='\033[31;1m'; v8_yellow='\033[33;1m'; v8_nc='\033[0m'
 v8_log() { logger -t "v8-boot" "$1"; printf "${v8_green}[INFO]${v8_nc} %s\n" "$1"; }
