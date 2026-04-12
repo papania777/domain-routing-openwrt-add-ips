@@ -1,8 +1,7 @@
 #!/bin/sh
 # =============================================================================
-# v6.4-stable.sh
-# Unified Domain + IP/Subnet/Community Routing + Sing-Box
-# FIXED: Removed broken $0 copy logic. Safe for sh <(wget -O - URL).
+# v6.5-final.sh
+# Unified Routing + Sing-Box (Fixed Reload Wipe & Init Script)
 # =============================================================================
 
 GREEN='\033[32;1m'; RED='\033[31;1m'; YELLOW='\033[33;1m'; NC='\033[0m'
@@ -11,10 +10,10 @@ log_w() { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 log_e() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 # =============================================================================
-# 1. CLEANUP
+# 1. CLEANUP & PRE-CREATE
 # =============================================================================
 v6_cleanup() {
-    log_i "Phase 1: Cleanup..."
+    log_i "Phase 1: Cleanup & Pre-create sets..."
     [ -f /etc/sing-box/config.json ] && cp /etc/sing-box/config.json "/etc/sing-box/config.json.bak.$(date +%s)" 2>/dev/null
     crontab -l 2>/dev/null | grep -v -e "add-ip-subnet-routing" -e "getdomains" -e "v6-unified" | crontab - 2>/dev/null || true
     for r in $(uci show firewall 2>/dev/null | grep -E "\.ipset='vpn_|\.set='vpn_domains'" | cut -d= -f1 | cut -d. -f2); do
@@ -29,21 +28,10 @@ v6_cleanup() {
 }
 
 # =============================================================================
-# 2. PRE-CREATE NFT SETS
-# =============================================================================
-v6_precreate_sets() {
-    log_i "Phase 2: Pre-creating nft sets..."
-    for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
-        nft list set inet fw4 "$s" >/dev/null 2>&1 || \
-            nft add set inet fw4 "$s" '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
-    done
-}
-
-# =============================================================================
-# 3. VALIDATE & REPAIR
+# 2. VALIDATE
 # =============================================================================
 v6_validate() {
-    log_i "Phase 3: Validate system..."
+    log_i "Phase 2: Validate system..."
     command -v curl >/dev/null 2>&1 || { log_e "curl missing"; exit 1; }
     command -v nft  >/dev/null 2>&1 || { log_e "nft missing"; exit 1; }
     grep -q "99 vpn" /etc/iproute2/rt_tables 2>/dev/null || {
@@ -61,10 +49,10 @@ v6_validate() {
 }
 
 # =============================================================================
-# 4. SING-BOX & DNS
+# 3. SERVICES (Sing-Box & DNS)
 # =============================================================================
 v6_setup_services() {
-    log_i "Phase 4: Services..."
+    log_i "Phase 3: Services..."
     if ! command -v sing-box >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1
         opkg install sing-box >/dev/null 2>&1 || { log_e "sing-box install failed"; exit 1; }
@@ -72,47 +60,22 @@ v6_setup_services() {
     if [ ! -f /etc/sing-box/config.json ]; then
         mkdir -p /etc/sing-box
         cat > /etc/sing-box/config.json << 'SBEOF'
-{
-  "log": { "level": "debug" },
-  "inbounds": [
-    {
-      "type": "tun",
-      "interface_name": "tun0",
-      "domain_strategy": "ipv4_only",
-      "address": ["172.16.250.1/30"],
-      "auto_route": false,
-      "strict_route": false,
-      "sniff": true
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "socks",
-      "tag": "proxy",
-      "server": "127.0.0.1",
-      "server_port": 1080
-    }
-  ],
-  "route": { "auto_detect_interface": true }
-}
+{"log":{"level":"debug"},"inbounds":[{"type":"tun","interface_name":"tun0","domain_strategy":"ipv4_only","address":["172.16.250.1/30"],"auto_route":false,"strict_route":false,"sniff":true}],"outbounds":[{"type":"socks","tag":"proxy","server":"127.0.0.1","server_port":1080}],"route":{"auto_detect_interface":true}}
 SBEOF
-        log_i "Sing-box config created. EDIT /etc/sing-box/config.json TO SET YOUR PROXY!"
+        log_i "Sing-box config created. EDIT IT MANUALLY!"
     else
-        log_i "Sing-box config exists (preserved)."
+        log_i "Sing-box config exists."
     fi
     /etc/init.d/sing-box enable 2>/dev/null
     /etc/init.d/sing-box restart 2>/dev/null
 
-    # DNS
     opkg list-installed | grep -q dnsmasq-full || {
-        opkg update >/dev/null 2>&1
-        cd /tmp && opkg download dnsmasq-full 2>/dev/null
+        opkg update >/dev/null 2>&1; cd /tmp && opkg download dnsmasq-full 2>/dev/null
         opkg remove dnsmasq 2>/dev/null && opkg install dnsmasq-full --cache /tmp 2>/dev/null
         [ -f /etc/config/dhcp-opkg ] && mv /etc/config/dhcp-opkg /etc/config/dhcp
     }
     uci get dhcp.@dnsmasq[0].confdir 2>/dev/null | grep -q /tmp/dnsmasq.d || {
-        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'
-        uci commit dhcp
+        uci set dhcp.@dnsmasq[0].confdir='/tmp/dnsmasq.d'; uci commit dhcp
     }
     mkdir -p /tmp/dnsmasq.d
     DOMAINS_URL="https://raw.githubusercontent.com/itdoginfo/allow-domains/main/Russia/inside-dnsmasq-nfset.lst"
@@ -129,10 +92,10 @@ SBEOF
 }
 
 # =============================================================================
-# 5. FIREWALL & HOTPLUG
+# 4. FIREWALL UCI & HOTPLUG
 # =============================================================================
-v6_setup_fw() {
-    log_i "Phase 5: Firewall & Hotplug..."
+v6_setup_fw_uci() {
+    log_i "Phase 4: Firewall UCI setup..."
     mkdir -p /etc/hotplug.d/iface
     cat > /etc/hotplug.d/iface/30-vpnroute << 'HEOF'
 #!/bin/sh
@@ -164,7 +127,7 @@ HEOF
 }
 
 # =============================================================================
-# 6. LOAD IP LISTS
+# 5. LOAD IP LISTS
 # =============================================================================
 v6_load_list() {
     ln="$1"; ls="$2"; lb="${3:-https://antifilter.download}"
@@ -194,7 +157,7 @@ v6_load_list() {
     log_i "Loaded ~$done into $ls."
 }
 v6_load_all() {
-    log_i "Phase 6: Loading IP lists..."
+    log_i "Phase 5: Loading IP lists..."
     v6_load_list "ip" "vpn_ip" "https://antifilter.download" &
     p1=$!; v6_load_list "subnet" "vpn_subnets" "https://antifilter.download" &
     p2=$!; v6_load_list "community" "vpn_community" "https://community.antifilter.download" &
@@ -203,25 +166,25 @@ v6_load_all() {
 }
 
 # =============================================================================
-# 7. DIRECT MARKING RULES
+# 6. APPLY NFT RULES (AFTER FIREWALL RELOAD!)
 # =============================================================================
 v6_apply_rules() {
-    log_i "Phase 7: Applying direct nft marking rules..."
+    log_i "Phase 7: Applying nft marking rules (post-reload)..."
+    # fw4 создает цепочки prerouting/output. Проверяем и добавляем.
     for chain in prerouting output; do
-        # Удаляем старые правила с нашими комментариями
-        nft list chain inet fw4 $chain 2>/dev/null | grep -B1 "v6_" | grep "handle" | awk '{print $2}' | while read h; do
-            nft delete rule inet fw4 $chain handle $h 2>/dev/null
-        done
-        # Добавляем новые
         for set in vpn_domains vpn_ip vpn_subnets vpn_community; do
-            nft add rule inet fw4 $chain ip daddr @$set meta mark set 0x1 comment "v6_${set}_${chain}" 2>/dev/null || log_w "Failed: $set in $chain"
+            # Добавляем только если правила еще нет
+            if ! nft list chain inet fw4 "$chain" 2>/dev/null | grep -q "v6_${set}_${chain}"; then
+                nft add rule inet fw4 "$chain" ip daddr "@${set}" meta mark set 0x1 comment "v6_${set}_${chain}" 2>/dev/null || \
+                    log_w "Failed to add rule: $set in $chain"
+            fi
         done
     done
     log_i "Marking rules active."
 }
 
 # =============================================================================
-# 8. EXPLICIT ROUTE & CRON
+# 7. ROUTE & CRON
 # =============================================================================
 v6_setup_route() {
     log_i "Phase 8: Route setup..."
@@ -234,7 +197,7 @@ v6_setup_route() {
 }
 
 v6_cron() {
-    log_i "Phase 9: Configuring cron..."
+    log_i "Phase 9: Cron setup..."
     cmd="0 */12 * * * /etc/init.d/v6-unified-routing start"
     cur=$(crontab -l 2>/dev/null) || cur=""
     echo "$cur" | grep -q "v6-unified-routing" 2>/dev/null && return 0
@@ -246,13 +209,14 @@ v6_cron() {
 # DIAGNOSTICS
 # =============================================================================
 v6_diagnose() {
-    echo "=== NFT SETS (REAL IP COUNT) ==="
+    echo "=== NFT SETS (IP COUNT) ==="
     for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
         cnt=$(nft list set inet fw4 "$s" 2>/dev/null | grep -E "^\s+[0-9]" | wc -l)
         printf "%-20s %s IPs\n" "$s:" "$cnt"
     done
     echo -e "\n=== MARKING RULES ==="
-    nft list ruleset 2>/dev/null | grep -c "v6_" || echo "0"
+    cnt=$(nft list ruleset 2>/dev/null | grep -c "v6_")
+    echo "Found: $cnt rules"
     echo -e "\n=== IP RULE ==="
     ip rule 2>/dev/null | grep "0x1" || echo "Not found"
     echo -e "\n=== VPN ROUTE ==="
@@ -268,32 +232,32 @@ v6_diagnose() {
 # =============================================================================
 v6_main() {
     echo "============================================================"
-    echo "  Unified Routing v6.4-Stable (Direct Execution)"
+    echo "  Unified Routing v6.5-Final (Fixed Reload Wipe)"
     echo "============================================================"
-    v6_precreate_sets
     v6_cleanup
     v6_validate
     v6_setup_services
-    v6_setup_fw
+    v6_setup_fw_uci
+    
+    # КРИТИЧЕСКИ ВАЖНО: reload делаем ДО добавления nft-правил
+    log_i "Reloading firewall to build chains..."
+    /etc/init.d/firewall reload >/dev/null 2>&1 || true
+    sleep 2
+    
     v6_load_all
     v6_apply_rules
     v6_setup_route
     v6_cron
-    /etc/init.d/firewall reload >/dev/null 2>&1 || true
     /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+    
     v6_diagnose
     echo "============================================================"
-    log_i "DONE."
-    echo "To install for auto-start & cron, run:"
-    echo "  wget -O /etc/init.d/v6-unified-routing <SCRIPT_URL>"
-    echo "  chmod +x /etc/init.d/v6-unified-routing"
-    echo "  /etc/init.d/v6-unified-routing start"
+    log_i "DONE. Rules preserved. To install for auto-start:"
+    log_i "  wget -q -O /etc/init.d/v6-unified-routing <YOUR_SCRIPT_URL>"
+    log_i "  chmod +x /etc/init.d/v6-unified-routing"
     echo "============================================================"
 }
 
-# =============================================================================
-# DISPATCHER (NO $0 COPY, SAFE FOR SH <(WGET...))
-# =============================================================================
 cmd="${1:-start}"
 case "$cmd" in
     start) v6_main ;;
