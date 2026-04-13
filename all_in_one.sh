@@ -1,8 +1,8 @@
 #!/bin/sh /etc/rc.common
 # =============================================================================
-# v9.0-one-command.sh
+# v9.1-fixed-enable.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ONE-COMMAND INSTALL: sh <(wget -O - URL)
+# ИСПРАВЛЕНО: Надёжная авто-установка через wget -O, чистая структура init
 # =============================================================================
 
 # OpenWrt init system
@@ -21,7 +21,7 @@ v8_log_w() { logger -t "v8-boot" "[WARN] $1"; printf "${v8_y}[WARN]${v8_n} %s\n"
 v8_log_e() { logger -t "v8-boot" "[ERROR] $1"; printf "${v8_r}[ERROR]${v8_n} %s\n" "$1"; }
 
 # =============================================================================
-# SING-BOX EXTENDED INSTALL (from install.sh, POSIX-compatible)
+# SING-BOX EXTENDED INSTALL (from install.sh)
 # =============================================================================
 v8_install_sb_ext() {
     v8_log "Updating sing-box-extended..."
@@ -278,35 +278,51 @@ v8_main() {
 }
 
 # =============================================================================
-# AUTO-INSTALL: ТОЛЬКО при запуске через sh <(wget...)
+# AUTO-INSTALL: Надёжная установка через wget -O
 # =============================================================================
 v8_auto_install() {
-    # Если уже установлен — пропускаем
-    [ -x "$V8_INIT_PATH" ] && { v8_log "Already installed at $V8_INIT_PATH"; return 0; }
-    
-    v8_tmp="/tmp/v8-self-install.sh"
-    
-    # Скачиваем себя
-    if wget -q -O "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null || curl -fsSL -o "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null; then
-        sed -i 's/\r$//' "$v8_tmp" 2>/dev/null
-        
-        # Проверяем shebang
-        if head -n 1 "$v8_tmp" | grep -q '#!/bin/sh /etc/rc.common'; then
-            # Устанавливаем
-            cp "$v8_tmp" "$V8_INIT_PATH"
-            chmod +x "$V8_INIT_PATH"
-            rm -f "$v8_tmp"
-            
-            # Включаем автозагрузку
-            "$V8_INIT_PATH" enable 2>/dev/null || true
-            
-            v8_log "✅ Auto-installed to $V8_INIT_PATH and enabled for auto-start"
-            return 0
-        fi
-        rm -f "$v8_tmp"
+    # Если уже установлен и работает — пропускаем
+    if [ -x "$V8_INIT_PATH" ] && [ -n "$(ls -l /etc/rc.d/*v8-unified* 2>/dev/null)" ]; then
+        v8_log "Already installed and enabled at $V8_INIT_PATH"
+        return 0
     fi
-    v8_log_w "Auto-install failed. Will run once without persistence."
-    return 1
+    
+    v8_log "Auto-installing to $V8_INIT_PATH..."
+    
+    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: скачиваем заново через wget -O, а не копируем $0
+    if wget -q -O "$V8_INIT_PATH" "$V8_SCRIPT_URL" 2>/dev/null || curl -fsSL -o "$V8_INIT_PATH" "$V8_SCRIPT_URL" 2>/dev/null; then
+        # Убираем CRLF
+        sed -i 's/\r$//' "$V8_INIT_PATH" 2>/dev/null
+        
+        # Проверяем shebang и делаем исполняемым
+        if head -n 1 "$V8_INIT_PATH" | grep -q '#!/bin/sh /etc/rc.common'; then
+            chmod +x "$V8_INIT_PATH"
+            
+            # 🔑 Включаем автозагрузку с проверкой результата
+            if "$V8_INIT_PATH" enable 2>&1 | grep -q "enabled\|symlink"; then
+                v8_log "✅ Auto-installed and ENABLED at $V8_INIT_PATH"
+            else
+                # Если enable не вывел ожидаемый текст — проверяем вручную
+                if [ -n "$(ls -l /etc/rc.d/*v8-unified* 2>/dev/null)" ]; then
+                    v8_log "✅ Auto-installed and enabled (symlinks created)"
+                else
+                    v8_log_w "enable command may have failed. Creating symlinks manually..."
+                    # Создаём симлинки вручную как fallback
+                    ln -sf ../init.d/v8-unified-routing /etc/rc.d/S99v8-unified-routing 2>/dev/null || true
+                    ln -sf ../init.d/v8-unified-routing /etc/rc.d/K01v8-unified-routing 2>/dev/null || true
+                    v8_log "✅ Manual symlinks created"
+                fi
+            fi
+            return 0
+        else
+            v8_log_e "Downloaded file has invalid shebang. Auto-install failed."
+            rm -f "$V8_INIT_PATH"
+            return 1
+        fi
+    else
+        v8_log_e "Failed to download script. Auto-install failed."
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -329,21 +345,18 @@ reload_service() {
 }
 
 # =============================================================================
-# ENTRY POINT: Определяем режим запуска
+# ENTRY POINT
 # =============================================================================
 
-# 🔑 КЛЮЧЕВОЙ МОМЕНТ:
 # Если запущен НЕ через procd (нет переменной PROCD_PARENT) И нет аргументов init-скрипта
 # → значит, запущен через sh <(wget...) → делаем авто-установку и выполняем main
-
 if [ -z "$PROCD_PARENT" ] && [ "${1:-}" != "start" ] && [ "${1:-}" != "stop" ] && [ "${1:-}" != "reload" ]; then
-    # Режим: sh <(wget -O - URL)
     v8_auto_install
     v8_main
     exit 0
 fi
 
-# Режим: /etc/init.d/v8-unified-routing start|stop|reload
+# Если вызван через procd — используем стандартные функции
 case "${1:-}" in
     start) start_service ;;
     stop) stop_service ;;
