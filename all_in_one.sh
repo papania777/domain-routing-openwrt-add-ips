@@ -1,8 +1,8 @@
 #!/bin/sh /etc/rc.common
 # =============================================================================
-# v9.1-fixed-enable.sh
+# v9.2-no-loop.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# ИСПРАВЛЕНО: Надёжная авто-установка через wget -O, чистая структура init
+# ИСПРАВЛЕНО: Защита от зацикливания авто-установки
 # =============================================================================
 
 # OpenWrt init system
@@ -13,6 +13,9 @@ REQUIRES="firewall network"
 
 V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
 V8_INIT_PATH="/etc/init.d/v8-unified-routing"
+
+# Флаг, чтобы избежать повторной авто-установки в одном запуске
+V8_AUTO_INSTALL_DONE=0
 
 # Colors
 v8_g='\033[32;1m'; v8_r='\033[31;1m'; v8_y='\033[33;1m'; v8_n='\033[0m'
@@ -278,49 +281,46 @@ v8_main() {
 }
 
 # =============================================================================
-# AUTO-INSTALL: Надёжная установка через wget -O
+# AUTO-INSTALL: С защитой от зацикливания
 # =============================================================================
 v8_auto_install() {
-    # Если уже установлен и работает — пропускаем
-    if [ -x "$V8_INIT_PATH" ] && [ -n "$(ls -l /etc/rc.d/*v8-unified* 2>/dev/null)" ]; then
-        v8_log "Already installed and enabled at $V8_INIT_PATH"
+    # 🔑 ГЛАВНОЕ ИСПРАВЛЕНИЕ: флаг, чтобы не зацикливаться
+    [ "$V8_AUTO_INSTALL_DONE" -eq 1 ] && return 0
+    V8_AUTO_INSTALL_DONE=1
+    
+    # Если файл уже есть и исполняем — считаем установленным
+    if [ -x "$V8_INIT_PATH" ]; then
+        # Пробуем включить (это создаст симлинки, если их нет)
+        "$V8_INIT_PATH" enable >/dev/null 2>&1 || true
+        v8_log "Script already installed at $V8_INIT_PATH"
         return 0
     fi
     
     v8_log "Auto-installing to $V8_INIT_PATH..."
     
-    # 🔑 КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: скачиваем заново через wget -O, а не копируем $0
+    # Скачиваем заново через wget/curl -O (не копируем $0!)
     if wget -q -O "$V8_INIT_PATH" "$V8_SCRIPT_URL" 2>/dev/null || curl -fsSL -o "$V8_INIT_PATH" "$V8_SCRIPT_URL" 2>/dev/null; then
-        # Убираем CRLF
         sed -i 's/\r$//' "$V8_INIT_PATH" 2>/dev/null
         
-        # Проверяем shebang и делаем исполняемым
         if head -n 1 "$V8_INIT_PATH" | grep -q '#!/bin/sh /etc/rc.common'; then
             chmod +x "$V8_INIT_PATH"
             
-            # 🔑 Включаем автозагрузку с проверкой результата
-            if "$V8_INIT_PATH" enable 2>&1 | grep -q "enabled\|symlink"; then
-                v8_log "✅ Auto-installed and ENABLED at $V8_INIT_PATH"
-            else
-                # Если enable не вывел ожидаемый текст — проверяем вручную
-                if [ -n "$(ls -l /etc/rc.d/*v8-unified* 2>/dev/null)" ]; then
-                    v8_log "✅ Auto-installed and enabled (symlinks created)"
-                else
-                    v8_log_w "enable command may have failed. Creating symlinks manually..."
-                    # Создаём симлинки вручную как fallback
-                    ln -sf ../init.d/v8-unified-routing /etc/rc.d/S99v8-unified-routing 2>/dev/null || true
-                    ln -sf ../init.d/v8-unified-routing /etc/rc.d/K01v8-unified-routing 2>/dev/null || true
-                    v8_log "✅ Manual symlinks created"
-                fi
-            fi
+            # Включаем автозагрузку (без проверки результата, чтобы не зацикливаться)
+            "$V8_INIT_PATH" enable >/dev/null 2>&1 || true
+            
+            # Создаём симлинки вручную как гарантированный fallback
+            ln -sf ../init.d/v8-unified-routing /etc/rc.d/S99v8-unified-routing 2>/dev/null || true
+            ln -sf ../init.d/v8-unified-routing /etc/rc.d/K01v8-unified-routing 2>/dev/null || true
+            
+            v8_log "✅ Auto-installed and enabled at $V8_INIT_PATH"
             return 0
         else
-            v8_log_e "Downloaded file has invalid shebang. Auto-install failed."
+            v8_log_e "Invalid shebang in downloaded file"
             rm -f "$V8_INIT_PATH"
             return 1
         fi
     else
-        v8_log_e "Failed to download script. Auto-install failed."
+        v8_log_e "Failed to download script"
         return 1
     fi
 }
