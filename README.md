@@ -5,4 +5,4 @@ https://github.com/itdoginfo/domain-routing-openwrt
 
 К domains.lst добавляется роутинг по ip.lst, subnet.lst и community.lst
 
-Источник всё так же antifilter.download
+Источник для новых .lst - antifilter.download
