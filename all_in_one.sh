@@ -1,60 +1,25 @@
-#!/bin/sh
+#!/bin/sh /etc/rc.common
 # =============================================================================
-# v9.0-production.sh
+# v9.0-one-command.sh
 # Unified Routing: Domain + IP/Subnet/Community + Sing-Box Extended
-# PRODUCTION: Auto-installs to /etc/init.d/ when run via sh <(wget...)
-# POSIX-compatible, no interactive prompts, full logging to logread
+# ONE-COMMAND INSTALL: sh <(wget -O - URL)
 # =============================================================================
 
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
+# OpenWrt init system
+USE_PROCD=1
+START=99
+STOP=95
+REQUIRES="firewall network"
 
-# Colors for terminal output
+# 🔧 ВНИМАНИЕ: Замените на ваш raw-URL!
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/all_in_one.sh"
+V8_INIT_PATH="/etc/init.d/v8-unified-routing"
+
+# Colors
 v8_g='\033[32;1m'; v8_r='\033[31;1m'; v8_y='\033[33;1m'; v8_n='\033[0m'
 v8_log() { logger -t "v8-boot" "$1"; printf "${v8_g}[INFO]${v8_n} %s\n" "$1"; }
 v8_log_w() { logger -t "v8-boot" "[WARN] $1"; printf "${v8_y}[WARN]${v8_n} %s\n" "$1"; }
 v8_log_e() { logger -t "v8-boot" "[ERROR] $1"; printf "${v8_r}[ERROR]${v8_n} %s\n" "$1"; }
-
-# =============================================================================
-# AUTO-INSTALL: Detects sh <(wget...) and installs to /etc/init.d/
-# =============================================================================
-v8_auto_install() {
-    v8_init="/etc/init.d/v8-unified-routing"
-    
-    # If already installed and executable, skip
-    [ -x "$v8_init" ] && { v8_log "Already installed at $v8_init"; return 0; }
-    
-    v8_tmp="/tmp/v8-install-tmp.sh"
-    
-    # Try to download ourselves
-    if wget -q -O "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null || curl -fsSL -o "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null; then
-        # Remove Windows line endings if present
-        sed -i 's/\r$//' "$v8_tmp" 2>/dev/null
-        
-        # Verify it's a valid script
-        if head -n 1 "$v8_tmp" | grep -q '#!/bin/sh'; then
-            # Install to init.d
-            cp "$v8_tmp" "$v8_init"
-            chmod +x "$v8_init"
-            rm -f "$v8_tmp"
-            
-            # Enable for auto-start (creates symlinks in /etc/rc.d/)
-            "$v8_init" enable 2>/dev/null || true
-            
-            # Setup cron for auto-update
-            /etc/init.d/cron enable 2>/dev/null || true
-            if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
-                (crontab -l 2>/dev/null || true; echo "0 */12 * * * $v8_init start") | crontab - 2>/dev/null
-                /etc/init.d/cron restart 2>/dev/null || true
-            fi
-            
-            v8_log "✅ Auto-installed to $v8_init and enabled for auto-start"
-            return 0
-        fi
-        rm -f "$v8_tmp"
-    fi
-    v8_log_w "Auto-install failed. Script will run once without persistence."
-    return 1
-}
 
 # =============================================================================
 # SING-BOX EXTENDED INSTALL (from install.sh, POSIX-compatible)
@@ -68,8 +33,7 @@ v8_install_sb_ext() {
     elif command -v wget >/dev/null 2>&1; then FETCH="wget -qO- --no-check-certificate"; DL="wget -q --no-check-certificate -O"
     else v8_log_e "curl/wget missing"; return 1; fi
 
-    SVC="sing-box"
-    [ -f "/etc/init.d/podkop" ] && SVC="podkop"
+    SVC="sing-box"; [ -f "/etc/init.d/podkop" ] && SVC="podkop"
 
     ARCH=$(uname -m)
     [ -f "/etc/openwrt_release" ] && D_ARCH=$(. /etc/openwrt_release && echo "$DISTRIB_ARCH") && \
@@ -280,7 +244,7 @@ v8_setup_route() {
 v8_setup_cron() {
     /etc/init.d/cron enable 2>/dev/null || true
     if ! crontab -l 2>/dev/null | grep -q "v8-unified-routing start"; then
-        (crontab -l 2>/dev/null || true; echo "0 */12 * * * /etc/init.d/v8-unified-routing start") | crontab - 2>/dev/null
+        (crontab -l 2>/dev/null || true; echo "0 */12 * * * $V8_INIT_PATH start") | crontab - 2>/dev/null
         /etc/init.d/cron restart 2>/dev/null || true
         v8_log "✅ Cron configured."
     fi
@@ -291,6 +255,15 @@ v8_setup_cron() {
 # =============================================================================
 v8_main() {
     v8_log "=== Script start ==="
+    
+    # Ждём готовности сети
+    w=0; while [ $w -lt 30 ]; do
+        if ip link show lo >/dev/null 2>&1 && [ -n "$(ip route 2>/dev/null | grep -E 'default|pppoe|wan')" ]; then
+            v8_log "✅ Network ready"; break
+        fi
+        sleep 1; w=$((w+1))
+    done
+    
     v8_cleanup
     v8_create_sets
     v8_validate
@@ -306,31 +279,75 @@ v8_main() {
 }
 
 # =============================================================================
-# DISPATCHER: Auto-install + dual-mode execution
+# AUTO-INSTALL: ТОЛЬКО при запуске через sh <(wget...)
+# =============================================================================
+v8_auto_install() {
+    # Если уже установлен — пропускаем
+    [ -x "$V8_INIT_PATH" ] && { v8_log "Already installed at $V8_INIT_PATH"; return 0; }
+    
+    v8_tmp="/tmp/v8-self-install.sh"
+    
+    # Скачиваем себя
+    if wget -q -O "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null || curl -fsSL -o "$v8_tmp" "$V8_SCRIPT_URL" 2>/dev/null; then
+        sed -i 's/\r$//' "$v8_tmp" 2>/dev/null
+        
+        # Проверяем shebang
+        if head -n 1 "$v8_tmp" | grep -q '#!/bin/sh /etc/rc.common'; then
+            # Устанавливаем
+            cp "$v8_tmp" "$V8_INIT_PATH"
+            chmod +x "$V8_INIT_PATH"
+            rm -f "$v8_tmp"
+            
+            # Включаем автозагрузку
+            "$V8_INIT_PATH" enable 2>/dev/null || true
+            
+            v8_log "✅ Auto-installed to $V8_INIT_PATH and enabled for auto-start"
+            return 0
+        fi
+        rm -f "$v8_tmp"
+    fi
+    v8_log_w "Auto-install failed. Will run once without persistence."
+    return 1
+}
+
+# =============================================================================
+# OPENWRT PROCD INTERFACE
+# =============================================================================
+start_service() {
+    v8_log "start_service called"
+    v8_main
+}
+
+stop_service() {
+    v8_log "Stopping..."
+    for s in vpn_domains vpn_ip vpn_subnets vpn_community; do
+        nft flush set inet fw4 "$s" 2>/dev/null || true
+    done
+}
+
+reload_service() {
+    stop_service; sleep 2; start_service
+}
+
+# =============================================================================
+# ENTRY POINT: Определяем режим запуска
 # =============================================================================
 
-# 1. FIRST: Try to auto-install ourselves if run via sh <(wget...)
-v8_auto_install
+# 🔑 КЛЮЧЕВОЙ МОМЕНТ:
+# Если запущен НЕ через procd (нет переменной PROCD_PARENT) И нет аргументов init-скрипта
+# → значит, запущен через sh <(wget...) → делаем авто-установку и выполняем main
 
-# 2. Check if called as init script with argument
+if [ -z "$PROCD_PARENT" ] && [ "${1:-}" != "start" ] && [ "${1:-}" != "stop" ] && [ "${1:-}" != "reload" ]; then
+    # Режим: sh <(wget -O - URL)
+    v8_auto_install
+    v8_main
+    exit 0
+fi
+
+# Режим: /etc/init.d/v8-unified-routing start|stop|reload
 case "${1:-}" in
-    start)
-        v8_main
-        ;;
-    stop)
-        v8_log "Stopping..."; for s in vpn_domains vpn_ip vpn_subnets vpn_community; do nft flush set inet fw4 "$s" 2>/dev/null || true; done
-        ;;
-    restart)
-        "$0" stop; sleep 2; "$0" start
-        ;;
-    enable|disable)
-        # Handled by /etc/rc.common symlinks, just log
-        logger -t "v8-boot" "Command $1 passed to init system"
-        ;;
-    *)
-        # If no argument (direct execution via sh <(wget...)), run main logic
-        v8_main
-        ;;
+    start) start_service ;;
+    stop) stop_service ;;
+    reload) reload_service ;;
 esac
-
 exit 0
