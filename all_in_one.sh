@@ -11,8 +11,7 @@ START=99
 STOP=95
 REQUIRES="firewall network"
 
-# 🔧 ВНИМАНИЕ: Замените на ваш raw-URL!
-V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/main/all_in_one.sh"
+V8_SCRIPT_URL="https://raw.githubusercontent.com/papania777/domain-routing-openwrt-add-ips/refs/heads/main/all_in_one.sh"
 V8_INIT_PATH="/etc/init.d/v8-unified-routing"
 
 # Colors
